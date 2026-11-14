@@ -1,0 +1,5 @@
+cargo:rustc-env=GIOCHI_TOWER_TARGET=aarch64-unknown-linux-gnu
+cargo:rustc-env=GIOCHI_TOWER_PROFILE=release
+cargo:rerun-if-changed=vendor/giochi-engine-3d/Cargo.toml
+cargo:rerun-if-changed=vendor/Cargo.toml
+cargo:rerun-if-changed=build.rs

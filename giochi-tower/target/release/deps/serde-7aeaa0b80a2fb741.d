@@ -1,0 +1,14 @@
+/home/charles/Giochi/GIOCHI-APP/app/jogos/giochi-tower/target/release/deps/serde-7aeaa0b80a2fb741.d: /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/charles/Giochi/GIOCHI-APP/app/jogos/giochi-tower/target/release/build/serde-46ba387d5d3c6968/out/private.rs
+
+/home/charles/Giochi/GIOCHI-APP/app/jogos/giochi-tower/target/release/deps/libserde-7aeaa0b80a2fb741.rlib: /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/charles/Giochi/GIOCHI-APP/app/jogos/giochi-tower/target/release/build/serde-46ba387d5d3c6968/out/private.rs
+
+/home/charles/Giochi/GIOCHI-APP/app/jogos/giochi-tower/target/release/deps/libserde-7aeaa0b80a2fb741.rmeta: /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/charles/Giochi/GIOCHI-APP/app/jogos/giochi-tower/target/release/build/serde-46ba387d5d3c6968/out/private.rs
+
+/home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/home/charles/Giochi/GIOCHI-APP/app/jogos/giochi-tower/target/release/build/serde-46ba387d5d3c6968/out/private.rs:
+
+# env-dep:OUT_DIR=/home/charles/Giochi/GIOCHI-APP/app/jogos/giochi-tower/target/release/build/serde-46ba387d5d3c6968/out

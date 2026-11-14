@@ -1,0 +1,14 @@
+/home/charles/Giochi/GIOCHI-APP/app/jogos/neon-drift/target/release/deps/thiserror-5f1e9b51e15ffeda.d: /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /home/charles/Giochi/GIOCHI-APP/app/jogos/neon-drift/target/release/build/thiserror-14db3cf68870d7a9/out/private.rs
+
+/home/charles/Giochi/GIOCHI-APP/app/jogos/neon-drift/target/release/deps/libthiserror-5f1e9b51e15ffeda.rlib: /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /home/charles/Giochi/GIOCHI-APP/app/jogos/neon-drift/target/release/build/thiserror-14db3cf68870d7a9/out/private.rs
+
+/home/charles/Giochi/GIOCHI-APP/app/jogos/neon-drift/target/release/deps/libthiserror-5f1e9b51e15ffeda.rmeta: /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs /home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs /home/charles/Giochi/GIOCHI-APP/app/jogos/neon-drift/target/release/build/thiserror-14db3cf68870d7a9/out/private.rs
+
+/home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/lib.rs:
+/home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/aserror.rs:
+/home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/display.rs:
+/home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/var.rs:
+/home/charles/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21/src/private.rs:
+/home/charles/Giochi/GIOCHI-APP/app/jogos/neon-drift/target/release/build/thiserror-14db3cf68870d7a9/out/private.rs:
+
+# env-dep:OUT_DIR=/home/charles/Giochi/GIOCHI-APP/app/jogos/neon-drift/target/release/build/thiserror-14db3cf68870d7a9/out

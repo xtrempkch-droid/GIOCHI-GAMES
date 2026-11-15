@@ -1,7 +1,7 @@
 {
   "title": "Cobrinha",
   "developer": "Giochi",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "arch": "aarch64",
   "runtime": "native",
   "graphics_api": "gles2",

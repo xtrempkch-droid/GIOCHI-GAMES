@@ -1,18 +1,28 @@
 //! Cobrinha 3D: regras puras no núcleo, renderização GLES pela GIOCHI-ENGINE 3D.
+//!
+//! Esta versão usa as novidades da engine 0.5 que fazem sentido para o jogo:
+//! HUD egui sobre GLES (`hud`), partículas de billboard, texturas procedurais,
+//! malha OBJ, hot reload de shader/malha e os contadores do profiler.
 
 mod cena3d;
+mod efeitos;
 mod evdev;
+mod hud;
+mod recarga;
+mod recursos;
 mod video;
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use cena3d::Cena3D;
+use cena3d::{AjustesCena, Cena3D};
 use giochi_cobrinha_core::{Acao, Direcao, Estado, Evento, Jogo, Relogio, ALVO_FPS, MAX_FPS};
 use giochi_engine::platform::sdl::Platform;
 use giochi_engine::platform::window::{Window, WindowConfig};
 use giochi_engine_3d::context::{self, GlesVersion};
 use giochi_engine_3d::DirectionalLight;
 use giochi_engine_3d::RenderContext3D;
+use hud::InfoQuadro;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::PixelFormatEnum;
@@ -34,6 +44,14 @@ struct Opcoes {
     /// `1.0` desenha na resolução da janela. Acima disso o quadro sai **maior** que a
     /// tela e é reduzido no passe final — mais nitidez de borda ao custo de fill rate.
     escala: f32,
+    /// HUD egui sobre a cena. Desligado num build sem a feature `hud`.
+    hud: bool,
+    /// Começa com os contadores de diagnóstico abertos (F1 alterna).
+    perfil: bool,
+    /// Fruta texturizada. `--sem-textura` volta ao Phong de cor sólida.
+    texturas: bool,
+    /// Modelo OBJ opcional; sem ele a procura padrão é `assets/modelos/maca.obj`.
+    modelo: Option<String>,
     json: bool,
     ajuda: bool,
     versao: bool,
@@ -52,6 +70,10 @@ fn opcoes(argv: Vec<String>) -> Result<Opcoes, String> {
         // exatamente **800×600** de alvo, e o jogo é leve o bastante para pagar.
         // `--escala 1` volta ao desenho nativo.
         escala: 1.25,
+        hud: hud::ATIVO,
+        perfil: false,
+        texturas: true,
+        modelo: None,
         json: false,
         ajuda: false,
         versao: false,
@@ -136,6 +158,22 @@ fn opcoes(argv: Vec<String>) -> Result<Opcoes, String> {
                 }
                 i += 2;
             }
+            "--modelo" => {
+                o.modelo = Some(argv.get(i + 1).ok_or("--modelo sem caminho")?.clone());
+                i += 2;
+            }
+            "--sem-textura" => {
+                o.texturas = false;
+                i += 1;
+            }
+            "--sem-hud" => {
+                o.hud = false;
+                i += 1;
+            }
+            "--perfil" => {
+                o.perfil = true;
+                i += 1;
+            }
             "--json" => {
                 o.json = true;
                 i += 1;
@@ -173,6 +211,7 @@ fn ajuda() {
 Uso:
   giochi-cobrinha                         jogar
   giochi-cobrinha --quadro <arquivo.bmp>  desenhar um quadro e sair
+  giochi-cobrinha --quadros 150 --quadro q.bmp  capturar o último de N quadros
   giochi-cobrinha --tamanho 640x480       painel simulado
   giochi-cobrinha --passos 40             adiantar a simulação
   giochi-cobrinha --teclas a,down,left    entrada simulada
@@ -180,13 +219,19 @@ Uso:
   giochi-cobrinha --fps-teto 75           limite configurável: 1 a 75
   giochi-cobrinha --escala 1.25           supersampling (640x480 -> alvo 800x600)
   giochi-cobrinha --escala 1              desenha na resolução da tela
+  giochi-cobrinha --sem-hud               sem o HUD egui (placar 3D de cubos)
+  giochi-cobrinha --perfil                HUD de diagnóstico aberto
+  giochi-cobrinha --sem-textura           fruta em cor sólida, sem textura
+  giochi-cobrinha --modelo <arquivo.obj>  modelo da fruta
   giochi-cobrinha --semente N             semente determinística
   giochi-cobrinha --json                  saída de máquina
   giochi-cobrinha --versao
 
 GIOCHI_GL_VERSION=2 solicita GLES 2.0; o padrão solicita GLES 3.0 com fallback.
 --escala aceita 0.25 a 2.0; abaixo de 1 reduz (mais FPS) e acima supersampleia
-(mais nitidez). O padrão 1.25 num painel 640x480 desenha em 800x600."
+(mais nitidez). O padrão 1.25 num painel 640x480 desenha em 800x600.
+F1 abre/fecha o diagnóstico.
+GIOCHI_HOT_RELOAD=1 liga o vigia de shader/OBJ também em release."
     );
 }
 
@@ -317,17 +362,47 @@ fn criar_render(
     Ok((janela, render))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn desenhar_quadro(
     render: &mut RenderContext3D,
     janela: &Window,
     cena: &mut Cena3D,
+    hud: Option<&mut hud::Hud>,
+    recarga: &mut recarga::Recarga,
     jogo: &Jogo,
+    recorde: u32,
     alpha: f32,
     tempo: f32,
+    delta: f32,
+    perfil: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     cena.preparar_quadro(render);
+    let _ = recarga.atualizar(render);
     render.begin_frame(janela);
-    cena.desenhar(render, jogo, alpha, tempo)?;
+    let placar_3d = hud.is_none();
+    cena.desenhar(render, jogo, alpha, tempo, placar_3d)?;
+
+    if let Some(hud) = hud {
+        let contadores = render.frame_counters();
+        let resumo = recarga.resumo();
+        let info = InfoQuadro {
+            pontos: jogo.pontos,
+            recorde,
+            estado: jogo.estado,
+            gles: render.gles_version().major(),
+            instancing: cena.usa_instancing(),
+            janela: render.drawable_size(),
+            alvo: render.render_size(),
+            escala: render.render_scale(),
+            // O HUD ainda não desenhou: estes são os contadores da cena 3D.
+            draws: contadores.draw_calls,
+            vertices: contadores.vertices_uploaded,
+            particulas: cena.particulas_ativas(),
+            detalhado: perfil,
+            recarga: &resumo,
+        };
+        hud.desenhar(render, &info, delta)?;
+    }
     Ok(())
 }
 
@@ -390,7 +465,41 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
             opcoes.escala
         );
     }
-    let mut cena = Cena3D::nova(&mut render, rotacao)?;
+
+    // Assets: o modelo OBJ e o shader vêm do disco e alimentam o hot reload; a
+    // textura é procedural e por isso não pode faltar no pacote.
+    let caminho_modelo = opcoes
+        .modelo
+        .as_ref()
+        .map(PathBuf::from)
+        .map(recursos::absoluto)
+        .or_else(|| recursos::procurar("assets/modelos/maca.obj"));
+    let caminho_shader = match (
+        recursos::procurar("assets/shaders/fruta.vert"),
+        recursos::procurar("assets/shaders/fruta.frag"),
+    ) {
+        (Some(vert), Some(frag)) => Some((vert, frag)),
+        _ => None,
+    };
+    let ajustes = AjustesCena {
+        textura: opcoes.texturas,
+        caminho_modelo: caminho_modelo.clone(),
+        caminho_shader: caminho_shader.clone(),
+    };
+    let (mut cena, carregados) = Cena3D::nova(&mut render, rotacao, &ajustes)?;
+    let mut recarga = recarga::Recarga::novo(carregados.shader, carregados.modelo);
+
+    let mut hud = if opcoes.hud {
+        match hud::Hud::novo(&mut render) {
+            Ok(hud) => Some(hud),
+            Err(erro) => {
+                eprintln!("aviso: HUD indisponível ({erro}); usando o placar 3D");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     if !opcoes.json {
         let projeto = video::projetar(rotacao, (largura, altura));
@@ -411,6 +520,29 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
             },
             versao_solicitada.major(),
             opcoes.fps
+        );
+        println!(
+            "cobrinha: HUD {}, partículas billboard, textura {}, hot reload {}",
+            if hud.is_some() {
+                "egui/GLES"
+            } else {
+                "placar 3D"
+            },
+            if opcoes.texturas {
+                "procedural"
+            } else {
+                "desligada"
+            },
+            if recarga.ativo() { "ativo" } else { "inativo" }
+        );
+        println!(
+            "cobrinha: modelo {}, shader {}",
+            caminho_modelo
+                .as_ref()
+                .map_or_else(|| "esfera embutida".to_owned(), |p| p.display().to_string()),
+            caminho_shader
+                .as_ref()
+                .map_or_else(|| "embutido".to_owned(), |(v, _)| v.display().to_string())
         );
     }
 
@@ -440,8 +572,20 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         sair |= aplicar(&mut jogo, *acao);
     }
 
-    if let Some(caminho) = &opcoes.quadro {
-        desenhar_quadro(&mut render, &janela, &mut cena, &jogo, 0.5, 0.4)?;
+    if let Some(caminho) = opcoes.quadro.as_ref().filter(|_| opcoes.quadros.is_none()) {
+        desenhar_quadro(
+            &mut render,
+            &janela,
+            &mut cena,
+            hud.as_mut(),
+            &mut recarga,
+            &jogo,
+            recorde,
+            0.5,
+            0.4,
+            1.0 / 60.0,
+            opcoes.perfil,
+        )?;
         let (w, h) = gravar_quadro(&render, (largura, altura), caminho)?;
         render.end_frame(&janela);
         let erro_gl = render.take_gl_error();
@@ -449,14 +593,20 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
             return Err(format!("erro GLES 0x{erro_gl:04x} ao desenhar o quadro").into());
         }
         if opcoes.json {
+            let contadores = render.frame_counters();
             println!(
-                "{{\"quadro\":\"gravado\",\"largura\":{w},\"altura\":{h},\"pontos\":{},\"gles\":{},\"fps_teto\":{}}}",
+                "{{\"quadro\":\"gravado\",\"largura\":{w},\"altura\":{h},\"pontos\":{},\"gles\":{},\"fps_teto\":{},\"draws\":{},\"hud\":{}}}",
                 jogo.pontos,
                 render.gles_version().major(),
-                opcoes.fps
+                opcoes.fps,
+                contadores.draw_calls,
+                hud.is_some()
             );
         } else {
             println!("cobrinha: quadro 3D {w}x{h} gravado em {caminho}");
+        }
+        if let Some(hud) = hud {
+            hud.destruir(&render);
         }
         render.release_all();
         return Ok(0);
@@ -464,11 +614,19 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
 
     let intervalo = Duration::from_secs_f64(1.0 / f64::from(opcoes.fps));
     let inicio = Instant::now();
+    let mut ultimo_quadro = inicio;
     let mut quadros = 0u32;
     let mut total_passos = 0u32;
+    let mut perfil = opcoes.perfil;
 
     while !sair {
         let inicio_quadro = Instant::now();
+        let delta = inicio_quadro
+            .duration_since(ultimo_quadro)
+            .as_secs_f32()
+            .min(0.1);
+        ultimo_quadro = inicio_quadro;
+
         for evento in plataforma.poll_events() {
             if let Event::Quit { .. } = evento {
                 sair = true;
@@ -486,6 +644,10 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
                     Some(Keycode::Left) => Some(Acao::Dir(Direcao::Esquerda)),
                     Some(Keycode::Right) => Some(Acao::Dir(Direcao::Direita)),
                     Some(Keycode::Space) | Some(Keycode::Return) => Some(Acao::Confirmar),
+                    Some(Keycode::F1) => {
+                        perfil = !perfil;
+                        None
+                    }
                     Some(Keycode::Escape) | Some(Keycode::Q) => Some(Acao::Sair),
                     _ => None,
                 };
@@ -506,24 +668,46 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         for _ in 0..passos.ticks {
             match jogo.passo() {
                 Evento::Comeu => {
+                    cena.comeu(&jogo)?;
                     let novo = giochi_cobrinha_core::TIQUE_BASE
                         + giochi_cobrinha_core::ACELERACAO * jogo.pontos as f32;
                     relogio.definir_tiques(novo.min(giochi_cobrinha_core::TIQUE_MAX));
                 }
-                Evento::Morreu(_) => recorde = recorde.max(jogo.pontos),
+                Evento::Morreu(_) => {
+                    cena.morreu(&jogo)?;
+                    recorde = recorde.max(jogo.pontos);
+                }
                 _ => {}
             }
             total_passos += 1;
         }
+        cena.atualizar_efeitos(delta)?;
 
         desenhar_quadro(
             &mut render,
             &janela,
             &mut cena,
+            hud.as_mut(),
+            &mut recarga,
             &jogo,
+            recorde,
             passos.alpha,
             tempo as f32,
+            delta,
+            perfil,
         )?;
+
+        let capturar = opcoes
+            .quadro
+            .as_ref()
+            .filter(|_| opcoes.quadros.is_some_and(|limite| quadros + 1 >= limite));
+        if let Some(caminho) = capturar {
+            let (w, h) = gravar_quadro(&render, (largura, altura), caminho)?;
+            if !opcoes.json {
+                println!("cobrinha: quadro 3D {w}x{h} gravado em {caminho}");
+            }
+        }
+
         render.end_frame(&janela);
         quadros += 1;
 
@@ -542,14 +726,24 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
     } else {
         0.0
     };
+    let erro_gl = render.take_gl_error();
+    if erro_gl != 0 {
+        return Err(format!("erro GLES 0x{erro_gl:04x} no laço de desenho").into());
+    }
+    let contadores = render.frame_counters();
     if opcoes.json {
         println!(
-            "{{\"quadros\":{quadros},\"passos\":{total_passos},\"segundos\":{decorrido:.3},\"fps\":{fps_medio:.1},\"fps_teto\":{},\"pontos\":{},\"atrasados\":{},\"gles\":{},\"instancing\":{}}}",
+            "{{\"quadros\":{quadros},\"passos\":{total_passos},\"segundos\":{decorrido:.3},\"fps\":{fps_medio:.1},\"fps_teto\":{},\"pontos\":{},\"atrasados\":{},\"gles\":{},\"instancing\":{},\"draws\":{},\"vertices\":{},\"particulas\":{},\"hud\":{},\"escala\":{:.2}}}",
             opcoes.fps,
             jogo.pontos.max(recorde),
             relogio.atrasados(),
             render.gles_version().major(),
-            cena.usa_instancing()
+            cena.usa_instancing(),
+            contadores.draw_calls,
+            contadores.vertices_uploaded,
+            cena.particulas_ativas(),
+            hud.is_some(),
+            opcoes.escala
         );
     } else {
         println!(
@@ -560,6 +754,9 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
             fps_medio,
             opcoes.fps
         );
+    }
+    if let Some(hud) = hud {
+        hud.destruir(&render);
     }
     render.release_all();
     Ok(0)
@@ -636,6 +833,24 @@ mod testes {
 
         let nativa = opcoes(vec!["--escala".into(), "1".into()]).unwrap();
         assert!((nativa.escala - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn o_hud_e_os_recursos_tem_interruptores() {
+        let padrao = opcoes(Vec::new()).unwrap();
+        assert!(padrao.texturas);
+        assert!(!padrao.perfil);
+        assert_eq!(padrao.hud, hud::ATIVO);
+
+        let cortado = opcoes(vec![
+            "--sem-hud".into(),
+            "--sem-textura".into(),
+            "--perfil".into(),
+        ])
+        .unwrap();
+        assert!(!cortado.hud);
+        assert!(!cortado.texturas);
+        assert!(cortado.perfil);
     }
 
     #[test]

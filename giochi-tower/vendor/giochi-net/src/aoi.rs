@@ -5,13 +5,19 @@
 //! O relatório traz a conta: mapa de 4×4 telas, ~150 inimigos, 4 clientes.
 //!
 //! ```text
-//! sem AOI:  150 inimigos × 5 bytes × 15 Hz × 4 clientes = 45 KB/s de upload
-//! com AOI:  ~13 inimigos × 5 bytes × 15 Hz × 4 clientes =  4 KB/s
+//! sem AOI:  150 inimigos × 14 bytes × 15 Hz × 4 clientes = 126 KB/s de upload
+//! com AOI:  ~13 inimigos × 14 bytes × 15 Hz × 4 clientes =  11 KB/s
 //! ```
 //!
-//! Num host ARM64 portátil alimentado por bateria e com rádio SDIO, 45 KB/s de
+//! Num host ARM64 portátil alimentado por bateria e com rádio SDIO, 126 KB/s de
 //! upload contínuo aparece como engasgo de framerate — e o culpado parece a
 //! GPU. É a diferença entre um jogo que roda e um que "trava sem motivo".
+//!
+//! Sem AOI, além do rádio, o próprio datagrama não caberia: 150 inimigos × 14
+//! bytes = 2100, acima de [`crate::DATAGRAMA_MAX`] (1200). O codificador trunca
+//! no último inimigo inteiro, então o cliente perderia em silêncio quase metade
+//! da horda. O corte por área é o que mantém a lista curta o bastante para caber
+//! **e** ser barata.
 //!
 //! ## O raio é parâmetro, não constante da engine
 //!

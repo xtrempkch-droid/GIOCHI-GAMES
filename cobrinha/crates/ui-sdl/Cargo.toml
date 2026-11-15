@@ -10,11 +10,27 @@ rust-version.workspace = true
 name = "giochi-cobrinha"
 path = "src/main.rs"
 
+[features]
+# O HUD é a novidade da fase 21 no caminho 3D. Fica ligado por omissão (é o que o
+# jogador vê), mas pode ser cortado num aparelho apertado: sem ele o jogo usa o
+# placar 3D de sempre e não linka o egui.
+default = ["hud", "hot_reload"]
+hud = ["dep:egui", "giochi-engine-3d/hud"]
+# Recarrega o shader e o modelo da fruta quando o arquivo muda. Em release o
+# vigia só arranca com GIOCHI_HOT_RELOAD=1, para não custar um inotify em produção.
+hot_reload = ["giochi-engine/hot_reload", "giochi-engine-3d/hot_reload"]
+
 [dependencies]
 giochi-cobrinha-core = { path = "../core" }
-giochi-engine = { path = "../../vendor/giochi-engine", default-features = false, features = ["sdl2-system"] }
-giochi-engine-3d = { path = "../../vendor/giochi-engine-3d", default-features = false, features = ["sdl2-system"] }
+giochi-engine = { path = "../../vendor/giochi-engine", default-features = false, features = ["sdl2-system", "profiling"] }
+giochi-engine-3d = { path = "../../vendor/giochi-engine-3d", default-features = false, features = ["sdl2-system", "profiling"] }
+# Mesma versão que a engine usa (0.32.3), então não há duas copias de egui.
+egui = { version = "0.32.3", optional = true }
 sdl2 = { version = "0.38", default-features = false }
 # `libc` já vinha transitivamente pelo `sdl2`, então declarar não baixa nada.
 # Serve para uma linha só: restaurar o `SIGPIPE` padrão (ver `main.rs`).
 libc = "0.2"
+
+[[test]]
+name = "upscale_segundo_quadro"
+# Precisa de um driver GLES; sem ele o teste diz que saltou, como os da engine.

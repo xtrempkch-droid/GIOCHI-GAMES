@@ -22,7 +22,11 @@ use crate::assets::ResourceManager;
 use crate::audio::AudioSystem;
 use crate::core::game_loop::{GameLoop, MAX_FRAME_TIME};
 use crate::core::time::{FrameClock, Time};
+#[cfg(feature = "devtools")]
+use crate::devtools::DevTools;
 use crate::error::GiochiError;
+#[cfg(feature = "hot_reload")]
+use crate::hot_reload::{HotReloadConfig, HotReloadEvent, HotReloader};
 use crate::input::keyboard::KEY_F1;
 use crate::input::Input;
 use crate::math::Color;
@@ -31,14 +35,66 @@ use crate::platform::window::WindowConfig;
 use crate::platform::{quit_signal, Platform};
 use crate::render::RenderContext;
 use crate::scene::{Scene, SceneManager, SceneTransition};
+#[cfg(feature = "devtools")]
+use crate::ui::{egui_integration::EguiBackend, Theme, Ui};
 
+#[cfg(feature = "hot_reload")]
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// A game's own reaction to a changed file, registered with
+/// [`Engine::register_hot_reload_handler`].
+///
+/// The callback receives the renderer and the path, and returns whether it applied the
+/// change. Returning `false` leaves the event counted as a failure in
+/// [`crate::hot_reload::HotReloadStats`], which is how a game notices that its custom
+/// format stopped parsing.
+///
+/// It is not `Send`: it runs on the engine's thread, inside the frame, not on the watch
+/// thread. See the [`crate::hot_reload`] module docs for why that is the only sound
+/// design.
+#[cfg(feature = "hot_reload")]
+pub type HotReloadHandler = Box<dyn FnMut(&mut RenderContext, &Path) -> bool>;
 
 /// Capacity of [`EngineConfig::title`], in bytes, including the trailing NUL.
 pub const ENGINE_TITLE_CAPACITY: usize = 64;
 
 /// Default background colour: near-black with a slight blue cast.
 pub const DEFAULT_CLEAR_COLOR: Color = Color::rgb(12, 14, 22);
+
+/// Whether presentation waits for vertical sync.
+///
+/// The mode is **derived from** [`EngineConfig::vsync`] rather than stored in a second
+/// field: `EngineConfig` is 112 bytes and its layout is locked by `tests/abi_layout.rs`,
+/// and two fields that could disagree would be a bug the C side is able to create.
+/// `Async` is `vsync == 0`; `Vsync` is anything else.
+///
+/// # Examples
+///
+/// ```
+/// use giochi_engine::{EngineConfig, PresentationMode};
+///
+/// let config = EngineConfig::new(640, 360, "demo");
+/// assert_eq!(config.presentation_mode(), PresentationMode::Vsync);
+///
+/// let async_config = config.with_async_presentation();
+/// assert_eq!(async_config.presentation_mode(), PresentationMode::Async);
+/// assert!(!async_config.is_vsync_enabled());
+/// ```
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PresentationMode {
+    /// Presentation waits for the display's vertical blank. No tearing; the frame rate is
+    /// capped by the panel.
+    #[default]
+    Vsync = 0,
+    /// Presentation happens as soon as the frame is ready.
+    ///
+    /// Requests swap interval `0`. It **may tear**, it does not create a worker thread,
+    /// and it does not make a driver that blocks internally non-blocking; it also does not
+    /// remove the engine's `target_fps` pacing, which is a separate mechanism.
+    Async = 1,
+}
 
 /// Configuration passed to [`Engine::new`].
 ///
@@ -122,6 +178,31 @@ impl EngineConfig {
     /// Whether vsync was requested.
     pub fn is_vsync_enabled(&self) -> bool {
         self.vsync != 0
+    }
+
+    /// The presentation mode these settings ask for.
+    pub fn presentation_mode(&self) -> PresentationMode {
+        if self.is_vsync_enabled() {
+            PresentationMode::Vsync
+        } else {
+            PresentationMode::Async
+        }
+    }
+
+    /// Requests `mode`, which is `vsync = 1` for [`PresentationMode::Vsync`] and `0` for
+    /// [`PresentationMode::Async`].
+    pub fn with_presentation_mode(mut self, mode: PresentationMode) -> Self {
+        self.vsync = match mode {
+            PresentationMode::Vsync => 1,
+            PresentationMode::Async => 0,
+        };
+        self
+    }
+
+    /// Shorthand for [`EngineConfig::with_presentation_mode`] with
+    /// [`PresentationMode::Async`].
+    pub fn with_async_presentation(self) -> Self {
+        self.with_presentation_mode(PresentationMode::Async)
     }
 
     /// The window configuration matching these dimensions.
@@ -224,6 +305,33 @@ pub struct Engine {
     frame_limit: Option<u64>,
     profiler: Profiler,
     overlay: DebugOverlay,
+    /// Watches assets when the `hot_reload` feature is on and the game asked for it.
+    ///
+    /// `Option` rather than a flag inside a live reloader so a build that never enables
+    /// it allocates no `inotify` state and the per-frame cost is one `None` check.
+    #[cfg(feature = "hot_reload")]
+    hot_reload: Option<HotReloader>,
+    /// Per-extension callbacks a game registered, checked before the built-in ones.
+    #[cfg(feature = "hot_reload")]
+    hot_reload_handlers: Vec<(String, HotReloadHandler)>,
+    /// Console, debug draw and the expanded overlay.
+    #[cfg(feature = "devtools")]
+    devtools: DevTools,
+    /// The single egui backend, shared by the console and the scene's UI.
+    ///
+    /// Created the first time something needs it and kept afterwards: building an egui
+    /// context allocates the font atlas, and doing that per frame would show up in the
+    /// numbers the panel reports.
+    #[cfg(feature = "devtools")]
+    ui_backend: Option<EguiBackend>,
+    /// The theme the scene's UI draws with.
+    #[cfg(feature = "devtools")]
+    ui_theme: Theme,
+    /// Multiplier applied to the frame time before the fixed-step accumulator.
+    ///
+    /// 1.0 unless `time_scale` changed it. Kept here rather than in `DevTools` so a build
+    /// without the feature still has the field and the same behaviour.
+    time_scale: f32,
     _reserved: [u32; 4],
 }
 
@@ -315,6 +423,17 @@ impl Engine {
             frame_limit: None,
             profiler: Profiler::new(),
             overlay: DebugOverlay::new(),
+            #[cfg(feature = "hot_reload")]
+            hot_reload: None,
+            #[cfg(feature = "hot_reload")]
+            hot_reload_handlers: Vec::new(),
+            #[cfg(feature = "devtools")]
+            devtools: DevTools::new(),
+            #[cfg(feature = "devtools")]
+            ui_backend: None,
+            #[cfg(feature = "devtools")]
+            ui_theme: Theme::dark(),
+            time_scale: 1.0,
             _reserved: [0; 4],
         })
     }
@@ -446,16 +565,24 @@ impl Engine {
         let _ = self.audio.take_profile_time_ns();
 
         let events = self.platform.poll_events();
+        // The devtools see every event first, and the ones they consume never reach
+        // `Input`: typing `w` in the console must not walk the player forward.
+        #[cfg(feature = "devtools")]
+        let events = self.filter_devtools_events(events);
         self.input.update(&events);
         if self.input.key_pressed(KEY_F1) {
             self.overlay.toggle();
         }
+        // Before `update`, so the scene sees the reloaded asset on the same frame the
+        // reload happened and a script that is about to restart has already left.
+        #[cfg(feature = "hot_reload")]
+        self.apply_hot_reload();
         for event in &events {
             self.game_loop.handle_quit_signal(quit_signal(event));
         }
 
         self.profiler.begin_scope("update");
-        let steps = self.game_loop.advance(frame_time);
+        let steps = self.game_loop.advance(frame_time * self.time_scale);
         for _ in 0..steps {
             self.time.advance(self.game_loop.fixed_timestep());
             let time = self.time;
@@ -488,8 +615,24 @@ impl Engine {
             Duration::from_secs_f32(frame_time),
             self.render.frame_counters(),
         );
+        // After `end_frame`, for the same reason as the overlay: a debug tool must not
+        // inflate the numbers it reports. The tools run before the overlay so the panel
+        // stays on top of the debug geometry.
+        #[cfg(feature = "devtools")]
+        self.draw_devtools(frame_time);
         // After `end_frame`, so the panel's own texture copy is excluded from the
         // numbers it shows; the next frame resets the counters before the scene draws.
+        #[cfg(feature = "devtools")]
+        {
+            // A closure, not a `Vec`: the panel refreshes at 1 Hz and building the lines
+            // on the other 59 frames is nine allocations each, which the frame-budget
+            // test reported as a regression the moment this was a `Vec`.
+            let devtools = &self.devtools;
+            let mut extra = || devtools.overlay_lines();
+            self.overlay
+                .draw_with(&mut self.render, &self.profiler, &mut extra);
+        }
+        #[cfg(not(feature = "devtools"))]
         self.overlay.draw(&mut self.render, &self.profiler);
 
         self.render.present();
@@ -702,6 +845,390 @@ impl Engine {
     pub fn game_loop(&self) -> &GameLoop {
         &self.game_loop
     }
+
+    /// The simulation speed multiplier.
+    ///
+    /// `1.0` is real time, `0.0` pauses the fixed-step accumulator (the world stops but
+    /// the window keeps rendering, which is what a debugger's pause looks like), and
+    /// values above 1 fast-forward. The console's `time_scale` command sets it.
+    pub fn time_scale(&self) -> f32 {
+        self.time_scale
+    }
+
+    /// Sets the simulation speed multiplier, clamped to the same range the console uses.
+    ///
+    /// With `devtools` compiled in this and the console's `time_scale` are the same
+    /// value: setting one is visible in the other.
+    pub fn set_time_scale(&mut self, scale: f32) {
+        let scale = if scale.is_finite() {
+            scale.clamp(0.0, crate::core::engine::MAX_TIME_SCALE)
+        } else {
+            1.0
+        };
+        #[cfg(feature = "devtools")]
+        self.devtools.set_time_scale(scale);
+        self.time_scale = scale;
+    }
+
+    /// The resource cache used by the renderer, mutably.
+    ///
+    /// Note that [`ResourceManager`]'s own reload methods take the registry as an
+    /// argument, and calling them through this accessor while also borrowing
+    /// [`Engine::render`] does not type-check. Use
+    /// [`RenderContext::reload_cached_texture`] instead; see `docs/HOT_RELOAD.md`.
+    pub fn resources_mut(&mut self) -> &mut ResourceManager {
+        self.render.resources_mut()
+    }
+}
+
+/// Developer tools: input filtering, drawing and the expanded overlay.
+#[cfg(feature = "devtools")]
+impl Engine {
+    /// The devtools state.
+    pub fn devtools(&self) -> &DevTools {
+        &self.devtools
+    }
+
+    /// The devtools state, mutably — where a game registers commands and reads flags.
+    pub fn devtools_mut(&mut self) -> &mut DevTools {
+        &mut self.devtools
+    }
+
+    /// Feeds the frame's events to the devtools and returns what the game may see.
+    ///
+    /// Only allocates when the console is open: with it closed there is nothing to
+    /// consume, and the original vector is handed back untouched.
+    fn filter_devtools_events(
+        &mut self,
+        events: Vec<sdl2::event::Event>,
+    ) -> Vec<sdl2::event::Event> {
+        // Walk until something is consumed. A closed console consumes nothing except the
+        // two toggles, so the common frame ends here with no allocation — which is the
+        // whole R2 story for this feature.
+        let first_consumed = events
+            .iter()
+            .position(|event| self.devtools.handle_event(event));
+
+        let Some(start) = first_consumed else {
+            return events;
+        };
+
+        let mut kept = Vec::with_capacity(events.len().saturating_sub(1));
+        kept.extend_from_slice(&events[..start]);
+        for event in &events[start + 1..] {
+            if !self.devtools.handle_event(event) {
+                kept.push(event.clone());
+            }
+        }
+        log::trace!("devtools consumed {} event(s)", events.len() - kept.len());
+        kept
+    }
+
+    /// Applies the console's requests and draws the tools into the frame.
+    fn draw_devtools(&mut self, frame_time: f32) {
+        if self.devtools.take_shader_reload_request() {
+            // The 2D renderer has no shaders. Saying so is better than a silent no-op:
+            // a `reload_shaders` that appears to work and does nothing is a trap.
+            let message = if cfg!(feature = "hot_reload") {
+                "reload_shaders: the 2D renderer has no shaders; \
+                 register a handler for your own assets"
+            } else {
+                "reload_shaders: no shader support in this build"
+            };
+            self.devtools
+                .console_mut()
+                .push_line(crate::devtools::LineKind::Notice, message);
+        }
+
+        self.devtools.set_frame_stats(
+            self.profiler.snapshot(),
+            self.profiler.summary(),
+            frame_time,
+        );
+        #[cfg(feature = "hot_reload")]
+        if let Some(reloader) = self.hot_reload.as_ref() {
+            self.devtools
+                .set_hot_reload_state(reloader.is_enabled(), reloader.stats().applied);
+        }
+
+        self.devtools.draw(&mut self.render);
+        self.draw_ui();
+
+        // A console `time_scale` must reach the loop: the tools own the value the command
+        // wrote, and the engine owns the one the accumulator uses.
+        self.time_scale = self.devtools.time_scale();
+    }
+
+    /// Runs one egui pass for the console, the scene's UI, or both.
+    ///
+    /// One pass, one context, one font atlas: the console is drawn as a bottom panel and
+    /// the scene gets the central panel, so a click on a button cannot also reach the game
+    /// through a second, independent UI.
+    fn draw_ui(&mut self) {
+        let scene_wants_ui = self
+            .scenes
+            .current()
+            .is_some_and(crate::scene::Scene::wants_ui);
+
+        if !self.devtools.wants_ui() && !scene_wants_ui {
+            // Nothing to draw: drop queued egui events so a later open cannot replay them.
+            self.devtools.clear_pending_events();
+            return;
+        }
+
+        let events = self.devtools.take_pending_events();
+        let screen = self.render.drawable_size();
+        let frame_time = self.devtools.frame_time();
+        let theme = self.ui_theme;
+        let mut backend = self.ui_backend.take().unwrap_or_else(EguiBackend::new);
+
+        let output = backend.run(screen, frame_time, &events, &mut |ctx| {
+            theme.apply(ctx);
+            self.devtools.draw_console_panel(ctx, screen);
+            if scene_wants_ui {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |inner| {
+                        if let Some(scene) = self.scenes.current_mut() {
+                            scene.render_ui(&mut Ui::new(inner, theme));
+                        }
+                    });
+            }
+        });
+
+        backend.paint(&mut self.render, output);
+        self.ui_backend = Some(backend);
+    }
+}
+
+/// Scene UI: the theme a game's menus draw with.
+#[cfg(feature = "devtools")]
+impl Engine {
+    /// The theme the scene's UI uses.
+    pub fn ui_theme(&self) -> Theme {
+        self.ui_theme
+    }
+
+    /// Replaces the theme. Takes effect on the next frame.
+    pub fn set_ui_theme(&mut self, theme: Theme) {
+        self.ui_theme = theme;
+    }
+}
+
+/// Hot reload: watching, polling and dispatch.
+///
+/// All of it is behind the `hot_reload` feature. Without it these methods do not exist,
+/// so a caller cannot depend on the module by accident.
+#[cfg(feature = "hot_reload")]
+impl Engine {
+    /// Starts watching `paths` for changes, using [`HotReloadConfig::from_env`].
+    ///
+    /// A path that names a directory is watched recursively; a path that names a file is
+    /// watched individually (through its parent, so an editor's rename-over-original
+    /// save is still seen). Returns how many paths were newly watched.
+    ///
+    /// Calling it twice replaces the previous set: the second call is "watch these now",
+    /// not "also watch these".
+    ///
+    /// ```no_run
+    /// # use giochi_engine::{Engine, EngineConfig};
+    /// # use std::path::PathBuf;
+    /// # fn example(engine: &mut Engine) -> Result<(), giochi_engine::GiochiError> {
+    /// engine.enable_hot_reload(&[PathBuf::from("assets")])?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`GiochiError::Asset`] when the watch backend cannot be started. A configuration
+    /// that disables hot reload returns `Ok(0)` and watches nothing — the call is a
+    /// no-op rather than an error, so a game can enable it unconditionally in debug and
+    /// let `GIOCHI_HOT_RELOAD=0` turn it off.
+    pub fn enable_hot_reload(&mut self, paths: &[PathBuf]) -> Result<usize, GiochiError> {
+        self.enable_hot_reload_with(HotReloadConfig::from_env(), paths)
+    }
+
+    /// Starts watching `paths` with an explicit configuration.
+    ///
+    /// # Errors
+    ///
+    /// [`GiochiError::Asset`] when the watch backend cannot be started.
+    pub fn enable_hot_reload_with(
+        &mut self,
+        config: HotReloadConfig,
+        paths: &[PathBuf],
+    ) -> Result<usize, GiochiError> {
+        let mut reloader = HotReloader::new(config);
+        let mut watched = 0usize;
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        for path in paths {
+            if path.is_dir() {
+                dirs.push(path.clone());
+            } else {
+                files.push(path.clone());
+            }
+        }
+        if !dirs.is_empty() {
+            watched += reloader.watch_dirs(&dirs)?;
+        }
+        if !files.is_empty() {
+            watched += reloader.watch_files(&files)?;
+        }
+        log::info!(
+            "hot reload {}: {watched} path(s) watched",
+            if reloader.is_enabled() { "on" } else { "off" }
+        );
+        self.hot_reload = Some(reloader);
+        Ok(watched)
+    }
+
+    /// Stops watching and drops the reloader.
+    pub fn disable_hot_reload(&mut self) {
+        if self.hot_reload.take().is_some() {
+            log::info!("hot reload disabled");
+        }
+    }
+
+    /// Whether a reloader exists and is watching.
+    pub fn is_hot_reload_enabled(&self) -> bool {
+        self.hot_reload
+            .as_ref()
+            .is_some_and(HotReloader::is_enabled)
+    }
+
+    /// The reloader, for its registry and its counters.
+    pub fn hot_reload(&self) -> Option<&HotReloader> {
+        self.hot_reload.as_ref()
+    }
+
+    /// The reloader, mutably.
+    pub fn hot_reload_mut(&mut self) -> Option<&mut HotReloader> {
+        self.hot_reload.as_mut()
+    }
+
+    /// Registers a callback for one extension, replacing the built-in behaviour.
+    ///
+    /// The extension is lower-cased and a leading dot is optional. Returns `false` for an
+    /// empty extension. A handler for `"png"` takes over texture reloading, which is what
+    /// a game does when its "texture" is a nine-slice definition that has to be re-sliced.
+    ///
+    /// Handlers run inside the frame, on the engine's thread, before the built-in path,
+    /// and only for events whose extension matches.
+    pub fn register_hot_reload_handler(
+        &mut self,
+        extension: &str,
+        handler: HotReloadHandler,
+    ) -> bool {
+        let extension = extension
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        if extension.is_empty() {
+            return false;
+        }
+        self.hot_reload_handlers
+            .retain(|(known, _)| known != &extension);
+        self.hot_reload_handlers.push((extension, handler));
+        true
+    }
+
+    /// Polls the watcher and applies what settled. Returns how many events applied.
+    ///
+    /// The engine already calls this once per frame; calling it again mid-frame is
+    /// harmless and mostly useful to a host that drives [`Engine::step`] itself.
+    pub fn poll_hot_reload(&mut self) -> usize {
+        self.apply_hot_reload()
+    }
+
+    /// Shared implementation of the per-frame hook and [`Self::poll_hot_reload`].
+    fn apply_hot_reload(&mut self) -> usize {
+        // Take the events out first: `poll` needs `&mut` on the reloader, and the
+        // dispatch below needs `&mut self.render`, so the two borrows must not overlap.
+        let events = match self.hot_reload.as_mut() {
+            Some(reloader) => reloader.poll(),
+            None => return 0,
+        };
+        if events.is_empty() {
+            return 0;
+        }
+
+        let mut applied = 0u64;
+        let mut failed = 0u64;
+        for event in events {
+            if !self.apply_hot_reload_event(&event) {
+                failed += 1;
+            } else {
+                applied += 1;
+            }
+        }
+
+        if let Some(reloader) = self.hot_reload.as_mut() {
+            reloader.note_applied(applied);
+            reloader.note_failed(failed);
+        }
+        (applied + failed) as usize
+    }
+
+    /// Applies one event, through a registered handler or the built-in path.
+    fn apply_hot_reload_event(&mut self, event: &HotReloadEvent) -> bool {
+        let extension = event
+            .extension()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+
+        // The game's handler wins: it knows what its format means.
+        if let Some((_, handler)) = self
+            .hot_reload_handlers
+            .iter_mut()
+            .find(|(known, _)| known == &extension)
+        {
+            let ok = handler(&mut self.render, event.path());
+            if ok {
+                log::info!("reloaded '{}' (custom handler)", event.path().display());
+            } else {
+                log::warn!(
+                    "custom reload handler for .{extension} failed on '{}'",
+                    event.path().display()
+                );
+            }
+            return ok;
+        }
+
+        match extension.as_str() {
+            // A generated texture has no source and a deleted file cannot be decoded;
+            // both are reported by the texture path itself and neither is fatal.
+            "png" | "bmp" | "jpg" | "jpeg" => {
+                let reloaded = self.render.reload_texture_path(event.path());
+                if reloaded == 0 {
+                    log::debug!(
+                        "'{}' is not loaded by this scene; nothing to reload",
+                        event.path().display()
+                    );
+                }
+                reloaded > 0
+            }
+            // A script is the program, not a resource: the Lua binding restarts its VM
+            // when the epoch moves. Bumping it is all the engine can do here.
+            "lua" => {
+                if event.is_deleted() {
+                    log::warn!(
+                        "'{}' was deleted; the running script keeps its last version",
+                        event.path().display()
+                    );
+                    return false;
+                }
+                let epoch = crate::hot_reload::bump_script_epoch();
+                log::info!(
+                    "script '{}' changed; script generation is now {epoch}",
+                    event.path().display()
+                );
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Drop for Engine {
@@ -709,11 +1236,21 @@ impl Drop for Engine {
         // Explicit teardown in dependency order; no RAII promise is made to the
         // caller, but the engine itself must not leak handles.
         self.scenes.clear();
+        #[cfg(feature = "devtools")]
+        if let Some(mut backend) = self.ui_backend.take() {
+            backend.release(&mut self.render);
+        }
         self.audio.clear();
         self.render.clear_resource_cache();
         self.render.textures().clear();
     }
 }
+
+/// Largest simulation multiplier accepted by [`Engine::set_time_scale`].
+///
+/// Duplicated from `devtools::MAX_TIME_SCALE` (which is behind a feature) so the clamp is
+/// the same in every build; the two values are asserted equal in the devtools tests.
+pub const MAX_TIME_SCALE: f32 = 8.0;
 
 /// Upper bound on scene transitions per run before the engine reports a bug.
 const MAX_TRANSITIONS: u32 = 10_000;

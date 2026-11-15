@@ -1532,4 +1532,46 @@ mod tests {
         assert!(s.map.contains(s.local().position));
         assert!((s.camera.focus - s.local().position).length() < 1.0e-4);
     }
+
+    /// O snapshot chega ao cliente com o sinal da coordenada intacto.
+    ///
+    /// O mapa é 160×160 m **centrado na torre**: metade dos inimigos nasce em
+    /// `-x` ou `-z`. O fio do `giochi-net` quantizava `x`/`z` em centímetros
+    /// `u16` sem sinal, então no cliente LAN todo inimigo do lado negativo
+    /// aparecia colado no eixo — a horda entrava pela borda errada. O teste
+    /// roda no nível do jogo porque o defeito só aparecia depois de
+    /// `snapshot_enemies` → `codificar` → `decodificar`, e é aqui que ele
+    /// reapareceria se alguém voltasse a "comprimir" o campo.
+    #[test]
+    fn the_snapshot_carries_negative_coordinates_across_the_wire() {
+        let c = config();
+        let mut s = combat(&c);
+        let def = c.enemy(EnemyKind::Grunt).expect("grunt");
+        // Uma das quatro bordas: `-limit` em `x`, `+limit` em `z`.
+        let mut enemy = Enemy::spawn(7, def, Vec3::new(-77.0, 0.0, 77.0), c.scaling_for_wave(1));
+        enemy.position = Vec3::new(-77.0, 0.0, 77.0);
+        s.enemies.push(enemy);
+
+        let enviado = s.snapshot_enemies();
+        let bytes = giochi_net::wire::Mensagem::Inimigos {
+            tick: s.tick as u32,
+            inimigos: enviado.clone(),
+        }
+        .codificar();
+        let recebido = match giochi_net::wire::Mensagem::decodificar(&bytes).expect("ida e volta") {
+            giochi_net::wire::Mensagem::Inimigos { inimigos, .. } => inimigos,
+            outra => panic!("esperava Inimigos, veio {outra:?}"),
+        };
+
+        assert_eq!(recebido, enviado, "o snapshot não sobreviveu ao fio");
+        let grunt = recebido
+            .iter()
+            .find(|i| i.id == 7)
+            .expect("o grunt do teste deveria estar no snapshot");
+        assert_eq!(
+            (grunt.x, grunt.z),
+            (-77.0, 77.0),
+            "coordenada negativa colapsou no eixo ao passar pelo fio"
+        );
+    }
 }

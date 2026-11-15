@@ -24,7 +24,7 @@ Fonte: `Giochi engine 3d/giochi-net/src/` (`main` = `49c5d63`).
 | `client::Cliente::processar` | `processar(orcamento: usize) -> Vec<Mensagem>` |
 | `client::Cliente::{jogador, rtt_ms, ultimo_tick, estado}` | já lidos |
 | `wire::Mensagem` variantes | `Handshake`, `HandshakeOk`, `HandshakeRecusado`, `Input`, `Jogador(ResumoJogador)`, `Inimigos{..}`, `Global{..}`, `ShopBuy{..}`, `Ping`, `Pong` |
-| constantes | `VERSAO_PROTOCOLO = 1`, `DATAGRAMA_MAX = 1200`, `SNAPSHOT_HZ = 15`, `PORTA_PADRAO = 47721` |
+| constantes | `VERSAO_PROTOCOLO = 2`, `DATAGRAMA_MAX = 1200`, `SNAPSHOT_HZ = 15`, `PORTA_PADRAO = 47721` |
 | `aoi::{AreaDeInteresse, FiltroAoi}` | `nova(x, z, raio)`, `da_tela(cx, cz, meia_diagonal)`, `contem`, `filtrar` |
 
 ## O que falta ler antes de tocar em código (4 campos)

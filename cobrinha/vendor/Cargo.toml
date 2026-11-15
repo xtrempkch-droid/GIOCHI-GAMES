@@ -1,26 +1,34 @@
+# Snapshot da GIOCHI-ENGINE 0.5.0 usada pelo Cobrinha.
+#
+# Copiada de GIOCHI-ENGINE-3D (commit f12c09b), com uma única alteração local
+# declarada no README do jogo: o upscaler aceita escala acima de 1.0
+# (supersampling). As demais crates da engine (capi, lua, net, demo) não são
+# usadas por este jogo e por isso não estão no snapshot.
 [workspace]
 resolver = "2"
 members = ["giochi-engine", "giochi-engine-3d"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.5.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.86"
 license = "MIT"
 authors = ["GIOCHI-SYSTEM contributors"]
 repository = "https://github.com/xtrempkch-droid/GIOCHI-SYSTEM"
 
 [workspace.dependencies]
-sdl2 = { version = "0.38", default-features = false }
-glam = "0.29"
+sdl2 = { version = "0.38", default-features = false, features = ["image", "mixer", "ttf", "unsafe_textures"] }
+glam = "0.34"
 anyhow = "1.0"
 thiserror = "2.0"
 log = "0.4"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
-mlua = { version = "0.12", features = ["lua54", "vendored"] }
-cbindgen = "0.27"
-criterion = { version = "0.5", features = ["html_reports"] }
-glow = "0.14"
+criterion = { version = "0.8", features = ["html_reports"] }
+glow = "0.18"
 bytemuck = { version = "1", features = ["derive"] }
 tobj = "4"
+notify = "6"
+egui = "0.32.3"
+rapier2d = { version = "0.36", default-features = false, features = ["dim2", "f32", "std", "block-solver"] }
+rapier3d = { version = "0.36", default-features = false, features = ["dim3", "f32", "std", "block-solver"] }

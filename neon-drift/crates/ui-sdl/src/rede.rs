@@ -110,12 +110,24 @@ pub struct CarroRede {
 }
 
 impl CarroRede {
-    /// Cor estável por id: o mesmo carro tem a mesma cor na tela de todos.
-    pub fn cor_do_id(id: u16) -> [f32; 3] {
+    /// Cor de um carro da rede, do ponto de vista de **quem desenha**.
+    ///
+    /// `meu_id` é `None` no host (o carro local é o `id 0`) e `Some(id)` no
+    /// cliente. Sem ele a cor saía só do id e cada lado pintava uma corrida
+    /// diferente: no cliente o carro do host recebia `COR_JOGADOR` — verde, a
+    /// cor do jogador — e o carro do próprio cliente recebia a cor de um
+    /// adversário, o que fazia a tela do cliente parecer a do host. As três IA
+    /// ficavam cinza, embora o host as desenhe nas cores de adversário.
+    pub fn cor_do_id(id: u16, meu_id: Option<u8>) -> [f32; 3] {
+        if Some(id) == meu_id.map(u16::from) {
+            return COR_JOGADOR;
+        }
         match id {
-            0 => COR_JOGADOR,
-            ID_IA.. => [0.72, 0.76, 0.88],
-            n => CORES_ADVERSARIOS[(n as usize - 1) % CORES_ADVERSARIOS.len()],
+            // No host o carro local é o id 0; num cliente ele é só mais um.
+            0 if meu_id.is_none() => COR_JOGADOR,
+            0 => CORES_ADVERSARIOS[0],
+            ID_IA.. => CORES_ADVERSARIOS[(id - ID_IA) as usize % CORES_ADVERSARIOS.len()],
+            n => CORES_ADVERSARIOS[(n as usize) % CORES_ADVERSARIOS.len()],
         }
     }
 }
@@ -256,6 +268,11 @@ pub enum EventoCtl {
         total: u8,
         /// Fase (`0` título, `1` correndo, `2` resultado).
         fase: u8,
+        /// Progresso do cliente desde a linha de largada, centímetros.
+        ///
+        /// Negativo antes de cruzar a linha. O cliente não simula o carro, então
+        /// este é o único jeito de o progresso local dele ser verdadeiro.
+        progresso_cm: i32,
     },
     /// H→C. A contagem terminou.
     Largada,
@@ -325,6 +342,7 @@ impl EventoCtl {
                 posicao,
                 total,
                 fase,
+                progresso_cm,
             } => {
                 b.push(CTL_ESTADO);
                 b.extend_from_slice(&tempo_cs.to_le_bytes());
@@ -334,6 +352,7 @@ impl EventoCtl {
                 b.push(posicao);
                 b.push(total);
                 b.push(fase);
+                b.extend_from_slice(&progresso_cm.to_le_bytes());
             }
             EventoCtl::Largada => b.push(CTL_LARGADA),
             EventoCtl::Volta { id, volta } => {
@@ -378,7 +397,7 @@ impl EventoCtl {
                 voltas: b[3],
                 comprimento: u16::from_le_bytes([b[4], b[5]]),
             }),
-            CTL_ESTADO if b.len() >= 15 => Some(EventoCtl::Estado {
+            CTL_ESTADO if b.len() >= 19 => Some(EventoCtl::Estado {
                 tempo_cs: u32::from_le_bytes([b[1], b[2], b[3], b[4]]),
                 contagem_cs: u16::from_le_bytes([b[5], b[6]]),
                 drift: u32::from_le_bytes([b[7], b[8], b[9], b[10]]),
@@ -386,6 +405,7 @@ impl EventoCtl {
                 posicao: b[12],
                 total: b[13],
                 fase: b[14],
+                progresso_cm: i32::from_le_bytes([b[15], b[16], b[17], b[18]]),
             }),
             CTL_LARGADA => Some(EventoCtl::Largada),
             CTL_VOLTA if b.len() >= 3 => Some(EventoCtl::Volta {
@@ -985,11 +1005,11 @@ impl Rede {
                 ));
             }
             if periodic {
-                let (volta, drift) = self
+                let (volta, drift, progresso_cm) = self
                     .clientes
                     .get(&id)
-                    .map(|c| (c.volta, c.drift.total()))
-                    .unwrap_or((1, 0));
+                    .map(|c| (c.volta, c.drift.total(), (c.progresso * 100.0) as i32))
+                    .unwrap_or((1, 0, 0));
 
                 eventos.push((
                     Some(id),
@@ -1001,6 +1021,7 @@ impl Rede {
                         posicao,
                         total,
                         fase: codigo_fase(corrida.fase),
+                        progresso_cm,
                     },
                 ));
             }
@@ -1109,7 +1130,8 @@ impl Rede {
                 angulo: c.carro.angulo,
                 altura: c.carro.altura,
                 velocidade: c.carro.velocidade,
-                cor: CarroRede::cor_do_id(u16::from(c.id)),
+                // No host o jogador local é o id 0; os clientes são adversários.
+                cor: CarroRede::cor_do_id(u16::from(c.id), None),
                 derrapando: c.carro.derrapando,
                 no_ar: c.carro.no_ar,
                 nitro: c.carro.nitro_usando,
@@ -1267,10 +1289,14 @@ impl Rede {
                 posicao,
                 total,
                 fase,
+                progresso_cm,
             } => {
                 if fase == 1 && corrida.fase != Fase::Correndo {
                     corrida.comecar();
                 }
+                // O cliente não roda `passo`, então o progresso local ficaria na
+                // grade: `largou()` diria "não" a corrida inteira.
+                corrida.sincronizar_progresso(progresso_cm as f32 / 100.0);
                 corrida.tempo = tempo_cs as f32 / 100.0;
                 corrida.contagem = contagem_cs as f32 / 100.0;
                 corrida.drift.pontos = drift;
@@ -1392,6 +1418,7 @@ impl Rede {
         }
 
         let pista = &corrida.pista;
+        let meu_id = Some(self.meu_id);
         let mut carros = Vec::with_capacity(self.trilhas.len());
         for (id, trilha) in &self.trilhas {
             let (x, z, angulo, velocidade, amostra) =
@@ -1405,7 +1432,7 @@ impl Rede {
                 angulo,
                 altura,
                 velocidade,
-                cor: CarroRede::cor_do_id(*id),
+                cor: CarroRede::cor_do_id(*id, meu_id),
                 derrapando: amostra.derrapando(),
                 no_ar: amostra.no_ar(),
                 nitro: amostra.nitro(),
@@ -1524,6 +1551,9 @@ mod testes {
                 posicao: 3,
                 total: 5,
                 fase: 1,
+                // Negativo de propósito: a grade põe o cliente atrás da linha, e
+                // um `u32`/`u16` aqui devolveria "quase uma volta".
+                progresso_cm: -1234,
             },
             EventoCtl::Largada,
             EventoCtl::Volta { id: 4, volta: 2 },
@@ -1568,6 +1598,38 @@ mod testes {
         assert!(volta.no_ar());
         assert!(volta.derrapando());
         assert!(!volta.nitro());
+    }
+
+    #[test]
+    fn a_pose_sobrevive_ao_fio_com_coordenada_negativa_e_rumo_cheio() {
+        // Regressão do cliente com o carro colado na origem: o `giochi-net`
+        // quantizava `x`/`z` em centímetros `u16` **sem sinal** (negativo virava
+        // 0) e mandava só o byte baixo do `hp`, onde este jogo empacota o rumo.
+        // O teste de ida e volta do crate usava só posições positivas e `hp`
+        // abaixo de 256, então passava com o bug dentro.
+        let mut carro = Carro::novo(Ponto::new(-37.25, -412.75), 5.9);
+        carro.velocidade = 33.0;
+        let s = codificar_snapshot(1, &carro);
+        // O snapshot atravessa o fio como o host o manda, não como o struct diz.
+        let bytes = Mensagem::Inimigos {
+            tick: 1,
+            inimigos: vec![s],
+        }
+        .codificar();
+        let Mensagem::Inimigos { inimigos, .. } =
+            Mensagem::decodificar(&bytes).expect("snapshot no fio")
+        else {
+            panic!("variante errada");
+        };
+        let amostra = decodificar_snapshot(&inimigos[0], Instant::now()).expect("amostra");
+        assert!((amostra.x + 37.25).abs() < 1e-3, "x = {}", amostra.x);
+        assert!((amostra.z + 412.75).abs() < 1e-3, "z = {}", amostra.z);
+        // O rumo volta em `0..TAU` (é o que `codificar_snapshot` normaliza) e o
+        // erro do arredondamento de 16 bits é 1e-4 rad; comparar o ângulo como
+        // ângulo evita depender da volta escolhida.
+        let diferenca = (amostra.angulo - 5.9).rem_euclid(std::f32::consts::TAU);
+        let diferenca = diferenca.min(std::f32::consts::TAU - diferenca);
+        assert!(diferenca < 1e-3, "rumo = {} (diferença {diferenca})", amostra.angulo);
     }
 
     #[test]
@@ -1633,10 +1695,46 @@ mod testes {
 
     #[test]
     fn a_cor_do_carro_e_estavel_e_distingue_host_de_ia() {
-        assert_eq!(CarroRede::cor_do_id(0), COR_JOGADOR);
-        assert_ne!(CarroRede::cor_do_id(1), CarroRede::cor_do_id(2));
-        assert_eq!(CarroRede::cor_do_id(101), CarroRede::cor_do_id(102));
-        assert_ne!(CarroRede::cor_do_id(0), CarroRede::cor_do_id(100));
+        assert_eq!(CarroRede::cor_do_id(0, None), COR_JOGADOR);
+        assert_ne!(
+            CarroRede::cor_do_id(1, None),
+            CarroRede::cor_do_id(2, None)
+        );
+        assert_eq!(
+            CarroRede::cor_do_id(100, None),
+            CarroRede::cor_do_id(103, None)
+        );
+        assert_ne!(
+            CarroRede::cor_do_id(0, None),
+            CarroRede::cor_do_id(100, None)
+        );
+    }
+
+    #[test]
+    fn cada_lado_pinta_como_jogador_o_carro_que_esta_sendo_dirigido() {
+        // Regressão do "a tela do cliente parece a do host": a cor vinha só do
+        // id, então no cliente o carro do host (id 0) saía verde de jogador e o
+        // carro do próprio cliente saía com cor de adversário.
+        assert_eq!(CarroRede::cor_do_id(0, None), COR_JOGADOR);
+        assert_eq!(CarroRede::cor_do_id(1, Some(1)), COR_JOGADOR);
+        assert_ne!(CarroRede::cor_do_id(0, Some(1)), COR_JOGADOR);
+        assert_ne!(CarroRede::cor_do_id(1, None), COR_JOGADOR);
+        // Um segundo cliente vê o primeiro como adversário e a si mesmo como
+        // jogador — as duas telas concordam sobre quem é quem.
+        assert_eq!(CarroRede::cor_do_id(2, Some(2)), COR_JOGADOR);
+        assert_ne!(CarroRede::cor_do_id(1, Some(2)), COR_JOGADOR);
+    }
+
+    #[test]
+    fn a_ia_tem_as_mesmas_cores_nos_dois_lados() {
+        // O host desenha a IA com `CORES_ADVERSARIOS[i]`; o cliente via cinza
+        // fixo, e a mesma corrida tinha duas paletas.
+        for i in 0..CORES_ADVERSARIOS.len() as u16 {
+            assert_eq!(
+                CarroRede::cor_do_id(ID_IA + i, Some(1)),
+                CORES_ADVERSARIOS[i as usize]
+            );
+        }
     }
 
     #[test]

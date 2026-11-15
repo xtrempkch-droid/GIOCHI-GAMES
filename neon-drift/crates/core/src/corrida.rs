@@ -346,6 +346,19 @@ impl Corrida {
         }
     }
 
+    /// Sincroniza o progresso com o valor que o host manda (cliente LAN).
+    ///
+    /// No cliente o `passo` não roda — a posição vem do snapshot —, então o
+    /// `progresso` ficaria congelado no valor da grade para sempre e
+    /// `largou()` responderia `false` mesmo com o carro 300 m adiante. O
+    /// ranking não depende disto (vem no `Estado`), mas o diagnóstico `--json`
+    /// e o `gap` dependem, e um número que mente esconde o próximo bug.
+    pub fn sincronizar_progresso(&mut self, progresso: f32) {
+        if progresso.is_finite() {
+            self.progresso = progresso;
+        }
+    }
+
     /// Posição do jogador na corrida, recalculada.
     pub fn calcular_posicao(&mut self) {
         let meu = self.progresso_jogador();

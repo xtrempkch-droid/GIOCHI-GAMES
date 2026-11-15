@@ -1,7 +1,7 @@
 {
   "title": "Neon Drift",
   "developer": "Giochi",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "arch": "aarch64",
   "runtime": "native",
   "graphics_api": "gles2",

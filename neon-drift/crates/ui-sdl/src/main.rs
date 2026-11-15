@@ -485,7 +485,7 @@ Uso:
   giochi-neon-drift --quadros 300           desenhar N quadros e sair
   giochi-neon-drift --passos 2000           adiantar a simulação
   giochi-neon-drift --em 1240 --teclas up   começar o carro em 1 240 m da volta
-  giochi-neon-drift --piloto                o piloto artificial dirige nos --passos
+  giochi-neon-drift --piloto                o piloto artificial dirige (nos --passos e nos quadros)
   giochi-neon-drift --teclas a,right,shift  teclas seguradas
   giochi-neon-drift --teclas-ciclo down;down;a
                                             toques de tecla (; = um toque)
@@ -1203,8 +1203,9 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         return Ok(0);
     }
 
-    // Quadro único: captura e sai, sem laço de eventos.
-    if let Some(caminho) = &o.quadro {
+    // Quadro único: captura e sai, sem laço de eventos. Com `--quadros N` a
+    // captura é a do último quadro do laço (ver o fim do laço), e não esta.
+    if let Some(caminho) = o.quadro.as_ref().filter(|_| o.quadros.is_none()) {
         // O overlay e o aviso também entram na captura: é o que permite
         // conferir o F1 e o rodapé de LAN num `--quadro` headless, sem tecla.
         if perfil.visivel() {
@@ -1333,12 +1334,24 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         // duas leituras e o quadro age sobre um estado que já mudou.
         gamepad.atualizar();
         let bits_agora = botoes.bits() | gamepad.bits() | botoes_simulados;
-        let (entrada, acoes) = entrada_jogo::combinar_com_analogico(
+        let (mut entrada, acoes) = entrada_jogo::combinar_com_analogico(
             bits_agora,
             gamepad.analogico(),
             &teclas,
             corrida.fase,
         );
+        // `--piloto` também dirige **nos quadros**, não só nos `--passos`.
+        //
+        // Antes ele só era consultado no laço de `--passos`, então
+        // `--quadros 1400 --piloto` mostrava o carro parado na grelha: o piloto
+        // avançava a corrida até onde `--passos` mandasse e o laço de quadros
+        // seguia com a entrada dos dispositivos, que num aparelho headless é
+        // nenhuma. O sintoma era um `--json` com `largou: false` e `s` na
+        // posição de grade depois de 1400 quadros — e a impressão de que a
+        // simulação não estava rodando.
+        if o.piloto && corrida.fase == Fase::Correndo {
+            entrada = giochi_neon_drift_core::piloto::entrada(&corrida);
+        }
         // Nível → borda. Segurar o direcional não pode andar seis linhas de menu
         // por quadro, e é a única regra que o laço precisa repetir por quadro.
         let bordas = entrada_jogo::bordas(ultimas_acoes, acoes);
@@ -1484,6 +1497,17 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         // nada sobre o custo do quadro.
         ms_cpu += t_cpu.elapsed().as_secs_f64() * 1000.0;
         perfil.fim_quadro(render.frame_counters());
+        // `--quadro` sozinho é um quadro só (ver acima); junto com `--quadros N`
+        // ele captura o **último** dos N, que é o que permite provar por imagem
+        // o que um cliente LAN desenhou depois de a corrida começar.
+        if let Some(caminho) = &o.quadro {
+            if o.quadros.is_some_and(|limite| quadros + 1 >= limite) {
+                let (w, h) = gravar_quadro(&render, caminho)?;
+                if !o.json {
+                    eprintln!("neon-drift: quadro {w}x{h} gravado em {caminho}");
+                }
+            }
+        }
         render.end_frame(&janela);
         quadros += 1;
 

@@ -193,13 +193,20 @@ const TAG_SHOP_BUY: u8 = 10;
 
 /// Bytes que um inimigo ocupa no snapshot.
 ///
-/// `id`(2) + `x`(2) + `z`(2) + `hp`(1) + `tipo`(1) + `fase_chefe`(1) = **9**.
+/// `id`(2) + `x`(4) + `z`(4) + `hp`(2) + `tipo`(1) + `fase_chefe`(1) = **14**.
 ///
 /// A primeira versão usava 5 aqui — número que eu tinha deduzido do campo
 /// "posição" e não do que o codificador realmente escreve. Com o divisor
 /// errado, 150 inimigos passavam do limite de datagrama e o crate produzia
 /// pacote grande demais. O teste pegou.
-const TAM_INIMIGO: usize = 9;
+///
+/// A versão seguinte usava 9 e **quantizava** `x`/`z` em centímetros `u16`
+/// sem sinal: coordenada negativa saturava em zero. Funcionava só num mapa do
+/// primeiro quadrante; um mundo centrado na origem (pista de corrida, tabuleiro
+/// simétrico) colapsava metade do mapa em cima dos eixos. O teste de ida e
+/// volta não pegou porque só usava posições positivas. Agora `x` e `z` vão como
+/// `f32` — o mesmo tipo do campo — e `hp` como `u16`, não como o byte baixo.
+const TAM_INIMIGO: usize = 14;
 
 struct Escritor {
     buf: Vec<u8>,
@@ -352,11 +359,16 @@ impl Mensagem {
                 w.u16(n as u16);
                 for ini in &inimigos[..n] {
                     w.u16(ini.id);
-                    // Quantiza a posição em centímetros inteiros: 1000x menor que
-                    // float, e 1 cm de erro é invisível num mapa de 4x4 telas.
-                    w.u16(quantizar(ini.x));
-                    w.u16(quantizar(ini.z));
-                    w.u8(ini.hp.min(255) as u8);
+                    // `f32`, não centímetros `u16`: a quantização não assinada
+                    // colapsava toda coordenada negativa em 0 e só cabia em
+                    // mapas do primeiro quadrante. O campo é `f32` na API; o
+                    // fio agora carrega o mesmo valor.
+                    w.f32(ini.x);
+                    w.f32(ini.z);
+                    // `u16` inteiro: é o tipo do campo. O byte baixo perdia o
+                    // rumo que o jogo empacota nos 16 bits (neon-drift usa a
+                    // faixa toda para o ângulo).
+                    w.u16(ini.hp);
                     w.u8(ini.tipo);
                     w.u8(ini.fase_chefe);
                 }
@@ -448,9 +460,9 @@ impl Mensagem {
                 for _ in 0..n {
                     inimigos.push(SnapshotInimigo {
                         id: r.u16()?,
-                        x: desquantizar(r.u16()?),
-                        z: desquantizar(r.u16()?),
-                        hp: r.u8()? as u16,
+                        x: r.f32()?,
+                        z: r.f32()?,
+                        hp: r.u16()?,
                         tipo: r.u8()?,
                         fase_chefe: r.u8()?,
                     });
@@ -480,27 +492,6 @@ impl Mensagem {
     pub fn tamanho(&self) -> usize {
         self.codificar().len()
     }
-}
-
-/// Posição `f32` → centímetros inteiros.
-///
-/// Faixa representável: `0..=655.35 m` (o campo é `u16` e a unidade é 1 cm).
-/// Coordenadas negativas saturam em 0 — o mapa deste projeto usa o primeiro
-/// quadrante —, e acima de 655.35 m satura no topo em vez de dar a volta,
-/// porque posição que "salta" no cliente é pior que posição colada na borda.
-fn quantizar(v: f32) -> u16 {
-    let cm = (v * 100.0).round();
-    if !cm.is_finite() || cm <= 0.0 {
-        return 0;
-    }
-    if cm >= u16::MAX as f32 {
-        return u16::MAX;
-    }
-    cm as u16
-}
-
-fn desquantizar(cm: u16) -> f32 {
-    cm as f32 / 100.0
 }
 
 #[cfg(test)]
@@ -638,7 +629,7 @@ mod testes {
 
     #[test]
     fn snapshot_trunca_no_ultimo_inimigo_inteiro() {
-        // 150 inimigos * 5 bytes + cabeçalho passa de 1200: tem de truncar sem
+        // 150 inimigos * 14 bytes + cabeçalho passa de 1200: tem de truncar sem
         // produzir datagrama inválido.
         let muitos: Vec<_> = (0..150)
             .map(|i| SnapshotInimigo {
@@ -708,11 +699,33 @@ mod testes {
     }
 
     #[test]
-    fn quantizacao_satura_em_vez_de_dar_a_volta() {
-        assert_eq!(quantizar(-1.0), 0);
-        assert_eq!(quantizar(f32::NAN), 0);
-        assert_eq!(quantizar(1e9), u16::MAX);
-        assert!((desquantizar(quantizar(2.5)) - 2.5).abs() < 0.011);
+    fn posicao_negativa_atravessa_o_fio_sem_perder_sinal() {
+        // Regressão do bug que deixava o cliente de neon-drift com o carro
+        // colado na origem: a quantização em centímetros `u16` transformava
+        // -1,0 em 0, e um mapa centrado na origem tem metade das coordenadas
+        // negativas. Qualquer valor fracionário também sobrevivia só com 1 cm
+        // de erro, e o `hp` só com o byte baixo.
+        let original = SnapshotInimigo {
+            id: 7,
+            x: -1.0,
+            z: -8.0,
+            // Ângulo empacotado nos 16 bits inteiros: 0xABCD é um valor que o
+            // `u8` do fio antigo transformava em 0xCD.
+            hp: 0xABCD,
+            tipo: 200,
+            fase_chefe: 5,
+        };
+        let bytes = Mensagem::Inimigos {
+            tick: 1,
+            inimigos: vec![original],
+        }
+        .codificar();
+        match Mensagem::decodificar(&bytes).expect("ida e volta") {
+            Mensagem::Inimigos { inimigos, .. } => {
+                assert_eq!(inimigos, vec![original]);
+            }
+            outro => panic!("variante errada: {outro:?}"),
+        }
     }
 
     #[test]

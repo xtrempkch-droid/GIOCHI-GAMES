@@ -37,7 +37,10 @@ mestre em [`../prompt.md`](../prompt.md).
   na onda 6 (só com o campo limpo) e **derrota** quando a torre cai.
 - Rede: protocolo em `postcard`, AOI derivada do frustum, stub de loopback
   host+cliente — o snapshot que a tela desenha é o que o **cliente** recebeu,
-  filtrado por AOI.
+  filtrado por AOI. O snapshot de inimigos viaja pelo `giochi-net` com `x`/`z`
+  em `f32`: o mapa é 160×160 m centrado na torre, então **metade das posições é
+  negativa** e a v1 do fio (centímetros `u16` sem sinal) colava esses inimigos
+  no eixo. Ver "O fio não comprime o tipo do campo", abaixo.
 
 A interface **desenha**: HUD (onda, relógio, gold, placar, HP do jogador e da
 torre), minimapa e tela da loja. É fonte de 5×7 em dados + câmera de 90° sobre o
@@ -280,6 +283,38 @@ giochi-tower --frames 1900 --posicionar 12,0 --sem-entrada --sem-mira --quadro /
 `--sem-entrada` existe porque no aparelho há controle conectado e o analógico
 parado emite ruído: sem ele o `aim` muda, o alvo da mira muda, e o mesmo `--frames`
 no PC e no R35S divergia em **68 % dos pixels** (medido).
+
+## O fio não comprime o tipo do campo
+
+O mapa é 160×160 m **centrado na torre** (`MapBounds::half_extent_m = 80`), e o
+spawn sorteia as quatro bordas: `x` ou `z` sai em `[-77, +77]`. Metade do mundo é
+negativa — e a v1 do `giochi-net` mandava o snapshot de inimigos com `x`/`z`
+quantizados em centímetros `u16` **sem sinal**:
+
+```text
+quantizar(-38.9) = 0        # toda coordenada negativa virava origem
+hp u16 0xABCD -> 0xCD       # só o byte baixo do campo sobrevivia
+```
+
+(O `hp` truncado não aparecia aqui: este jogo envia `enemy.hp_u16()` no snapshot
+mas ainda não lê o campo no cliente — a vida do boss viaja noutra mensagem. O
+que doía era a coordenada.)
+
+No cliente LAN isso aparecia como a horda entrando **pela borda errada**: todo
+inimigo do lado negativo era desenhado em cima do eixo `x=0`/`z=0`, e como o
+giro também é derivado de `(-x).atan2(-z)`, eles ainda apontavam para o lado
+errado. O host, que simula de verdade, ficava correto — o defeito era só do
+cliente. É o mesmo modo de falha que o neon-drift reportou.
+
+A v2 carrega `f32` para posição e `u16` inteiro para `hp` (9 → 14 bytes por
+inimigo, `VERSAO_PROTOCOLO` 1 → 2). Medido com dois processos reais, uma horda
+visível ao cliente cobre `x -48.1..21.5`, `z -26.6..43.1`: os dois lados.
+
+O teste que guarda isso é
+`game::state::tests::the_snapshot_carries_negative_coordinates_across_the_wire`
+— ele monta o snapshot pelo caminho do jogo (`snapshot_enemies`) e o passa por
+`codificar`/`decodificar`, porque um teste que só olha o `struct` não cruza a
+fronteira onde o dado sumia.
 
 ## Verificar
 

@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "giochi-neon-drift"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "giochi-engine",
  "giochi-engine-3d",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "giochi-neon-drift-core"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "giochi-net"

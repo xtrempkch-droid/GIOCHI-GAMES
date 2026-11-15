@@ -1,12 +1,15 @@
 use std::error::Error;
+use std::path::PathBuf;
 
 use giochi_cobrinha_core::{Jogo, COLUNAS, LINHAS};
 use giochi_engine_3d::math3d::{Camera3D, Color3D, Mat4, Quat, Transform3D, Vec3};
 use giochi_engine_3d::mesh::{cube, StaticBatchBuilder};
-use giochi_engine_3d::render3d::{MeshHandle, ShaderHandle};
+use giochi_engine_3d::render3d::{MeshHandle, ShaderHandle, TextureHandle};
 use giochi_engine_3d::shader::BuiltinShader;
 use giochi_engine_3d::RenderContext3D;
 
+use crate::efeitos::Efeitos;
+use crate::recursos;
 use crate::video::Rotacao;
 
 const FUNDO: Color3D = Color3D::new(0.025, 0.035, 0.075, 1.0);
@@ -19,6 +22,20 @@ const COMIDA: Color3D = Color3D::new(1.0, 0.22, 0.3, 1.0);
 const PLACAR: Color3D = Color3D::new(1.0, 0.72, 0.24, 1.0);
 const PRONTA: Color3D = Color3D::new(0.22, 0.96, 0.48, 1.0);
 const PERDIDA: Color3D = Color3D::new(1.0, 0.16, 0.22, 1.0);
+
+/// O que a cena deve carregar do disco ou gerar em memória.
+pub struct AjustesCena {
+    pub textura: bool,
+    pub caminho_modelo: Option<PathBuf>,
+    pub caminho_shader: Option<(PathBuf, PathBuf)>,
+}
+
+/// Handles que o hot reload precisa conhecer, devolvidos por `Cena3D::nova`.
+#[derive(Default)]
+pub struct RecursosCarregados {
+    pub shader: Option<(PathBuf, PathBuf, ShaderHandle)>,
+    pub modelo: Option<(PathBuf, MeshHandle)>,
+}
 
 pub struct Cena3D {
     casas_claras: MeshHandle,
@@ -33,10 +50,22 @@ pub struct Cena3D {
     rotacao: Rotacao,
     corpo: Vec<Mat4>,
     digitos: Vec<Mat4>,
+    /// Textura e shader da fruta. `None` quando a textura foi desligada ou o
+    /// asset não carregou; nesse caso a fruta volta ao Phong de cor sólida.
+    textura_fruta: Option<TextureHandle>,
+    shader_fruta: ShaderHandle,
+    escala_fruta: f32,
+    altura_fruta: f32,
+    efeitos: Efeitos,
+    proximo_brilho: f32,
 }
 
 impl Cena3D {
-    pub fn nova(render: &mut RenderContext3D, rotacao: Rotacao) -> Result<Self, Box<dyn Error>> {
+    pub fn nova(
+        render: &mut RenderContext3D,
+        rotacao: Rotacao,
+        ajustes: &AjustesCena,
+    ) -> Result<(Self, RecursosCarregados), Box<dyn Error>> {
         let (vertices, indices) = cube(1.0);
         let mut claras = StaticBatchBuilder::with_capacity(
             (COLUNAS * LINHAS / 2) as usize * vertices.len(),
@@ -64,29 +93,81 @@ impl Cena3D {
         let paredes = criar_paredes(render, &vertices, &indices, rotacao)?;
         let painel_placar = render.create_mesh(&vertices, &indices)?;
         let cubo = render.create_mesh(&vertices, &indices)?;
-        let fruta = render.create_sphere_mesh(0.42, 12, 16)?;
         let phong = render.create_builtin_shader(BuiltinShader::Phong)?;
+
+        let mut carregados = RecursosCarregados::default();
+        let (fruta, escala_fruta, altura_fruta) = match ajustes.caminho_modelo.as_deref() {
+            Some(caminho) => match render.load_obj_mesh(caminho) {
+                Ok(malha) => {
+                    carregados.modelo = Some((caminho.to_path_buf(), malha));
+                    (malha, 0.45, 0.50)
+                }
+                Err(erro) => {
+                    eprintln!(
+                        "aviso: modelo '{}' não carregou ({erro}); usando a esfera",
+                        caminho.display()
+                    );
+                    (render.create_sphere_mesh(0.42, 12, 16)?, 1.0, 0.43)
+                }
+            },
+            None => (render.create_sphere_mesh(0.42, 12, 16)?, 1.0, 0.43),
+        };
+
+        let (textura_fruta, shader_fruta) = if ajustes.textura {
+            let (largura, altura, pixels) = recursos::textura_maca();
+            let textura = render.create_texture_from_rgba(largura, altura, &pixels)?;
+            let shader = match ajustes.caminho_shader.as_ref() {
+                Some((vert, frag)) => match render.load_shader(vert, frag) {
+                    Ok(handle) => {
+                        carregados.shader = Some((vert.clone(), frag.clone(), handle));
+                        handle
+                    }
+                    Err(erro) => {
+                        eprintln!(
+                            "aviso: shader '{}' não compilou ({erro}); usando o embutido",
+                            vert.display()
+                        );
+                        render.create_builtin_shader(BuiltinShader::Textured)?
+                    }
+                },
+                None => render.create_builtin_shader(BuiltinShader::Textured)?,
+            };
+            (Some(textura), shader)
+        } else {
+            (None, phong)
+        };
+
         let instancing = render.supports_instancing();
         let instanciado = if instancing {
             Some(render.create_builtin_shader(BuiltinShader::Instanced)?)
         } else {
             None
         };
+        let efeitos = Efeitos::novo(render)?;
 
-        Ok(Self {
-            casas_claras,
-            casas_escuras,
-            paredes,
-            painel_placar,
-            cubo,
-            fruta,
-            phong,
-            instanciado,
-            instancing,
-            rotacao,
-            corpo: Vec::with_capacity((COLUNAS * LINHAS) as usize),
-            digitos: Vec::with_capacity(21),
-        })
+        Ok((
+            Self {
+                casas_claras,
+                casas_escuras,
+                paredes,
+                painel_placar,
+                cubo,
+                fruta,
+                phong,
+                instanciado,
+                instancing,
+                rotacao,
+                corpo: Vec::with_capacity((COLUNAS * LINHAS) as usize),
+                digitos: Vec::with_capacity(21),
+                textura_fruta,
+                shader_fruta,
+                escala_fruta,
+                altura_fruta,
+                efeitos,
+                proximo_brilho: 0.0,
+            },
+            carregados,
+        ))
     }
 
     pub fn usa_instancing(&self) -> bool {
@@ -97,12 +178,48 @@ impl Cena3D {
         render.set_clear_color(FUNDO);
     }
 
+    /// Estouro de partículas na célula onde a cobra comeu.
+    ///
+    /// A posição vem da **cabeça**, não de `jogo.comida`: o `passo` já sorteou a
+    /// fruta nova antes de devolver `Evento::Comeu`, então a comida atual é a
+    /// seguinte e o estouro apareceria no lugar errado.
+    pub fn comeu(&mut self, jogo: &Jogo) -> Result<(), Box<dyn Error>> {
+        let (x, z) = mundo(
+            jogo.cabeca_pos().x as f32,
+            jogo.cabeca_pos().y as f32,
+            self.rotacao,
+        );
+        self.efeitos.comer(Vec3::new(x, 0.55, z))?;
+        Ok(())
+    }
+
+    /// Estouro de partículas no ponto em que a cobra bateu.
+    pub fn morreu(&mut self, jogo: &Jogo) -> Result<(), Box<dyn Error>> {
+        let (x, z) = mundo(
+            jogo.cabeca_pos().x as f32,
+            jogo.cabeca_pos().y as f32,
+            self.rotacao,
+        );
+        self.efeitos.morrer(Vec3::new(x, 0.5, z))?;
+        Ok(())
+    }
+
+    pub fn atualizar_efeitos(&mut self, delta: f32) -> Result<(), Box<dyn Error>> {
+        self.efeitos.atualizar(delta)?;
+        Ok(())
+    }
+
+    pub fn particulas_ativas(&self) -> usize {
+        self.efeitos.ativos()
+    }
+
     pub fn desenhar(
         &mut self,
         render: &mut RenderContext3D,
         jogo: &Jogo,
         alpha: f32,
         tempo: f32,
+        placar_3d: bool,
     ) -> Result<(), Box<dyn Error>> {
         let camera = camera_para(render.drawable_size(), tempo);
         render.draw_mesh_colored(
@@ -127,17 +244,50 @@ impl Cena3D {
             BORDA,
         )?;
 
-        self.desenhar_placar(render, &camera, jogo.pontos)?;
+        if placar_3d {
+            self.desenhar_placar(render, &camera, jogo.pontos)?;
+        }
         self.desenhar_corpo(render, &camera, jogo, alpha)?;
 
         let (fx, fz) = mundo(jogo.comida.x as f32, jogo.comida.y as f32, self.rotacao);
         let pulsar = 1.0 + 0.12 * tempo.sin();
         let comida = Transform3D::new(
-            Vec3::new(fx, 0.43, fz),
+            Vec3::new(fx, self.altura_fruta, fz),
             Quat::from_axis_angle(Vec3::UP, tempo),
-            Vec3::new(pulsar, pulsar, pulsar),
+            Vec3::new(
+                self.escala_fruta * pulsar,
+                self.escala_fruta,
+                self.escala_fruta * pulsar,
+            ),
         );
-        render.draw_mesh_colored(self.fruta, self.phong, &comida, &camera, COMIDA)?;
+        match self.textura_fruta {
+            Some(textura) => {
+                render.draw_mesh_textured(
+                    self.fruta,
+                    self.shader_fruta,
+                    textura,
+                    &comida,
+                    &camera,
+                    Color3D::WHITE,
+                )?;
+            }
+            None => {
+                render.draw_mesh_colored(self.fruta, self.phong, &comida, &camera, COMIDA)?;
+            }
+        }
+
+        // Brilho ambiente em volta da fruta: uma partícula a cada ~75 ms. É
+        // barato (o pool é fixo) e dá vida ao objeto que o jogador persegue.
+        if jogo.estado == giochi_cobrinha_core::Estado::Jogando && tempo >= self.proximo_brilho {
+            self.proximo_brilho = tempo + 0.075;
+            let fase = tempo * 37.0;
+            let brilho = Vec3::new(
+                fx + fase.sin() * 0.34,
+                0.42 + 0.18 * (fase * 1.7).cos(),
+                fz + fase.cos() * 0.34,
+            );
+            self.efeitos.brilhar(brilho)?;
+        }
 
         match jogo.estado {
             giochi_cobrinha_core::Estado::Pronto => {
@@ -164,6 +314,7 @@ impl Cena3D {
             giochi_cobrinha_core::Estado::Jogando => {}
         }
 
+        self.efeitos.desenhar(render, &camera)?;
         Ok(())
     }
 

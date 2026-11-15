@@ -23,7 +23,7 @@ use sdl2::rect::FPoint;
 use sdl2::render::Vertex;
 
 use crate::error::GiochiError;
-use crate::math::Rect;
+use crate::math::{Color, Rect};
 use crate::render::texture::{TextureHandle, TextureSize};
 
 /// Default number of sprites a batch holds before it asks to be flushed.
@@ -39,9 +39,6 @@ pub const DEFAULT_MAX_SPRITES: u32 = 1024;
 
 /// Default number of sprites' worth of vertex capacity allocated up front.
 pub const DEFAULT_INITIAL_SPRITES: u32 = 256;
-
-/// Vertex colour used for every batched quad: white multiplies the texture unchanged.
-const VERTEX_COLOR: SdlColor = SdlColor::RGBA(255, 255, 255, 255);
 
 /// Configuration of a [`SpriteBatch`].
 ///
@@ -109,7 +106,7 @@ struct Run {
     /// The quad's rectangles, kept only while the run holds exactly one. A run of one
     /// has nothing to merge, and a backend copy of one quad is cheaper than building
     /// and submitting four vertices — measured at ~4 % on the software renderer.
-    single: Option<(Rect, Rect)>,
+    single: Option<(Rect, Rect, Color)>,
 }
 
 /// How [`crate::render::RenderContext::flush_batch`] should draw one run.
@@ -121,6 +118,12 @@ pub(crate) enum RunKind<'a> {
         dst: Rect,
         /// Source rectangle in texture pixels; empty means the whole texture.
         src: Rect,
+        /// Colour multiplied over the texture.
+        tint: Color,
+        /// Vertices for a tinted single quad.
+        vertices: &'a [Vertex],
+        /// Indices for a tinted single quad.
+        indices: &'a [i32],
     },
     /// Several quads sharing a texture: draw them as one geometry call.
     Geometry {
@@ -254,7 +257,19 @@ impl SpriteBatch {
         src: Rect,
         texture_size: TextureSize,
     ) -> Result<(), GiochiError> {
-        let Some(quad) = Quad::new(dst, src, texture_size) else {
+        self.push_quad_tinted(texture, dst, src, texture_size, Color::WHITE)
+    }
+
+    /// Queues a textured quad with a colour multiplied over its texture.
+    pub(crate) fn push_quad_tinted(
+        &mut self,
+        texture: TextureHandle,
+        dst: Rect,
+        src: Rect,
+        texture_size: TextureSize,
+        tint: Color,
+    ) -> Result<(), GiochiError> {
+        let Some(quad) = Quad::new(dst, src, texture_size, tint) else {
             return Ok(());
         };
 
@@ -267,7 +282,7 @@ impl SpriteBatch {
                 vertex_count: 0,
                 first_index: self.indices.len() as u32,
                 index_count: 0,
-                single: Some((dst, src)),
+                single: Some((dst, src, tint)),
             });
         }
 
@@ -306,25 +321,35 @@ impl SpriteBatch {
     }
 
     /// Every queued run, in submission order, with the data needed to draw it.
-    pub(crate) fn flush_runs(&self) -> Vec<RunView<'_>> {
-        self.runs
-            .iter()
-            .map(|run| {
-                let kind = match run.single {
-                    Some((dst, src)) => RunKind::Single { dst, src },
-                    None => RunKind::Geometry {
-                        vertices: &self.vertices[run.first_vertex as usize
-                            ..(run.first_vertex + run.vertex_count) as usize],
-                        indices: &self.indices[run.first_index as usize
-                            ..(run.first_index + run.index_count) as usize],
-                    },
-                };
-                RunView {
-                    texture: run.texture,
-                    kind,
-                }
-            })
-            .collect()
+    ///
+    /// Returned as an iterator rather than a `Vec` on purpose: this runs once per frame
+    /// from [`crate::render::RenderContext::flush_batch`], and collecting the runs
+    /// allocated on every frame of every game. The runs and their vertex data already
+    /// live in this struct, so there is nothing to own.
+    pub(crate) fn flush_runs(&self) -> impl Iterator<Item = RunView<'_>> {
+        self.runs.iter().map(|run| {
+            let kind = match run.single {
+                Some((dst, src, tint)) => RunKind::Single {
+                    dst,
+                    src,
+                    tint,
+                    vertices: &self.vertices
+                        [run.first_vertex as usize..(run.first_vertex + run.vertex_count) as usize],
+                    indices: &self.indices
+                        [run.first_index as usize..(run.first_index + run.index_count) as usize],
+                },
+                None => RunKind::Geometry {
+                    vertices: &self.vertices
+                        [run.first_vertex as usize..(run.first_vertex + run.vertex_count) as usize],
+                    indices: &self.indices
+                        [run.first_index as usize..(run.first_index + run.index_count) as usize],
+                },
+            };
+            RunView {
+                texture: run.texture,
+                kind,
+            }
+        })
     }
 }
 
@@ -340,7 +365,7 @@ struct Quad {
 }
 
 impl Quad {
-    fn new(dst: Rect, src: Rect, texture_size: TextureSize) -> Option<Self> {
+    fn new(dst: Rect, src: Rect, texture_size: TextureSize, tint: Color) -> Option<Self> {
         let (dst, src) = sanitise(dst, src)?;
         let (u0, v0, u1, v1) = uv_rect(src, texture_size)?;
 
@@ -351,9 +376,10 @@ impl Quad {
         let (dst, _, _) = shrink_destination_to_source(dst, src, texture_size);
         let (left, top, right, bottom) = (dst.x, dst.y, dst.x + dst.w, dst.y + dst.h);
 
+        let tint = SdlColor::RGBA(tint.r, tint.g, tint.b, tint.a);
         let vertex = |x: f32, y: f32, u: f32, v: f32| Vertex {
             position: FPoint::new(x, y),
-            color: VERTEX_COLOR,
+            color: tint,
             tex_coord: FPoint::new(u, v),
         };
 
@@ -741,10 +767,13 @@ mod tests {
                 .expect("push");
         }
 
-        let runs = batch.flush_runs();
+        // The test collects; the renderer does not. `flush_batch` walks the iterator
+        // directly, which is what keeps the per-frame allocation out of the hot path.
+        let runs: Vec<_> = batch.flush_runs().collect();
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].texture, 3);
-        let RunKind::Geometry { vertices, indices } = runs[0].kind else {
+        let first = &runs[0];
+        assert_eq!(first.texture, 3);
+        let RunKind::Geometry { vertices, indices } = &first.kind else {
             panic!("two quads share a texture, so the run is geometry");
         };
         assert_eq!(vertices.len(), 8);
@@ -755,11 +784,12 @@ mod tests {
             "the second quad of a run follows the first, relative to the run"
         );
 
-        assert_eq!(runs[1].texture, 4);
-        let RunKind::Single { dst, src } = runs[1].kind else {
+        let second = &runs[1];
+        assert_eq!(second.texture, 4);
+        let RunKind::Single { dst, src, .. } = &second.kind else {
             panic!("a run of one quad keeps its rectangles");
         };
-        assert_eq!(dst, Rect::new(0.0, 0.0, 4.0, 4.0));
+        assert_eq!(*dst, Rect::new(0.0, 0.0, 4.0, 4.0));
         assert!(src.is_empty(), "an empty source means the whole texture");
     }
 
@@ -771,13 +801,13 @@ mod tests {
             .push_quad(7, Rect::new(1.0, 2.0, 4.0, 4.0), src, size(64, 64))
             .expect("push");
 
-        let runs = batch.flush_runs();
+        let runs: Vec<_> = batch.flush_runs().collect();
         assert_eq!(runs.len(), 1);
-        let RunKind::Single { dst, src: kept } = runs[0].kind else {
+        let RunKind::Single { dst, src: kept, .. } = &runs[0].kind else {
             panic!("one quad is a single run");
         };
-        assert_eq!(dst, Rect::new(1.0, 2.0, 4.0, 4.0));
-        assert_eq!(kept, src, "the original source rectangle is preserved");
+        assert_eq!(*dst, Rect::new(1.0, 2.0, 4.0, 4.0));
+        assert_eq!(*kept, src, "the original source rectangle is preserved");
     }
 
     #[test]
@@ -790,8 +820,30 @@ mod tests {
             .push_quad(1, Rect::new(4.0, 0.0, 4.0, 4.0), Rect::ZERO, size(8, 8))
             .expect("push");
 
-        let runs = batch.flush_runs();
+        let runs: Vec<_> = batch.flush_runs().collect();
         assert_eq!(runs.len(), 1);
         assert!(matches!(runs[0].kind, RunKind::Geometry { .. }));
+    }
+
+    #[test]
+    fn tinted_quads_store_the_requested_vertex_colour() {
+        let mut batch = SpriteBatch::new();
+        let tint = Color::new(20, 40, 60, 80);
+
+        batch
+            .push_quad_tinted(
+                1,
+                Rect::new(0.0, 0.0, 4.0, 4.0),
+                Rect::ZERO,
+                size(8, 8),
+                tint,
+            )
+            .expect("push");
+
+        assert_eq!(
+            batch.vertices()[0].color,
+            SdlColor::RGBA(tint.r, tint.g, tint.b, tint.a)
+        );
+        assert_eq!(batch.draw_calls(), 1);
     }
 }

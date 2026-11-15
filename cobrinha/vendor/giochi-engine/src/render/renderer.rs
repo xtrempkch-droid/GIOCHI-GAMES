@@ -1,5 +1,6 @@
 //! The 2D rendering context.
 
+use std::path::Path;
 use std::rc::Rc;
 
 use sdl2::render::{TextureCreator, WindowCanvas};
@@ -115,32 +116,54 @@ impl RenderContext {
             return;
         }
 
-        for run in self.batch.flush_runs() {
+        // Fields are borrowed separately instead of through `self`: the runs are an
+        // iterator over `self.batch` now, and it stays alive for the whole loop while
+        // the body needs `self.textures` and `self.canvas`.
+        let Self {
+            batch,
+            textures,
+            canvas,
+            counters,
+            ..
+        } = self;
+
+        for run in batch.flush_runs() {
             let handle = run.texture;
-            let Some(texture) = self.textures.resolve(handle) else {
+            let Some(texture) = textures.resolve(handle) else {
                 // A texture destroyed with sprites still queued: those sprites were
                 // submitted first, but there is nothing left to draw them with.
                 log::debug!("batched draw skipped: texture {handle} is no longer alive");
                 continue;
             };
             let result = match run.kind {
-                // Nothing to merge in a run of one: the plain copy is cheaper than
-                // building and submitting four vertices for a single sprite.
-                RunKind::Single { dst, src } => match to_sdl_rect(dst) {
-                    Some(dst) => self.canvas.copy(&texture, to_sdl_rect(src), dst),
-                    // The run only exists because the quad had an area, so this is
-                    // unreachable; treated as "nothing to draw" rather than a panic.
-                    None => Ok(()),
-                },
+                // Nothing to merge in a white run of one: the plain copy is cheaper
+                // than submitting geometry. Tinting needs the vertex colour path.
+                RunKind::Single {
+                    dst,
+                    src,
+                    tint,
+                    vertices,
+                    indices,
+                } => {
+                    if tint == Color::WHITE {
+                        match to_sdl_rect(dst) {
+                            Some(dst) => canvas.copy(&texture, to_sdl_rect(src), dst),
+                            None => Ok(()),
+                        }
+                    } else {
+                        canvas.render_geometry(vertices, Some(&texture), indices)
+                    }
+                }
                 RunKind::Geometry { vertices, indices } => {
-                    self.canvas
-                        .render_geometry(vertices, Some(&texture), indices)
+                    canvas.render_geometry(vertices, Some(&texture), indices)
                 }
             };
             match result {
                 Ok(()) => {
                     #[cfg(feature = "profiling")]
-                    self.counters.record_draw_calls(1);
+                    counters.record_draw_calls(1);
+                    #[cfg(not(feature = "profiling"))]
+                    let _ = counters;
                 }
                 Err(err) => log::error!("batched draw failed: {err}"),
             }
@@ -265,9 +288,84 @@ impl RenderContext {
         self.textures.dimensions(texture)
     }
 
+    /// The file `texture` was loaded from, or `None` for a generated one.
+    pub fn texture_source(&self, texture: TextureHandle) -> Option<String> {
+        self.textures.source_path(texture)
+    }
+
+    /// Reloads `texture` from the file it came from, keeping the same handle.
+    ///
+    /// This is what the hot reloader calls. It does **not** flush the batch: queued
+    /// sprites hold handles, not pixels, so they draw the reloaded image on the frame
+    /// that is already in flight — which is exactly the behaviour a developer wants.
+    ///
+    /// # Errors
+    ///
+    /// [`GiochiError::Asset`] when the file is gone or no longer decodes (the old
+    /// texture is kept), [`GiochiError::InvalidArgument`] for a generated texture, and
+    /// [`GiochiError::InvalidHandle`] for an unknown handle.
+    pub fn reload_texture(&mut self, texture: TextureHandle) -> Result<(), GiochiError> {
+        self.textures.reload(texture)
+    }
+
+    /// Reloads every live texture that was loaded from `path`.
+    ///
+    /// Returns how many reloaded. `0` means no texture came from that file, which is
+    /// not an error: an edited asset that the running scene never loaded is the normal
+    /// case.
+    pub fn reload_texture_path(&mut self, path: &Path) -> usize {
+        let handles: Vec<TextureHandle> = self
+            .textures
+            .handles()
+            .into_iter()
+            .filter(|handle| {
+                self.textures
+                    .source_path(*handle)
+                    .is_some_and(|source| same_file(Path::new(&source), path))
+            })
+            .collect();
+
+        let mut reloaded = 0usize;
+        for handle in handles {
+            match self.textures.reload(handle) {
+                Ok(()) => {
+                    reloaded += 1;
+                    log::info!("reloaded texture {handle} from '{}'", path.display());
+                }
+                // A shared texture, or a file that no longer decodes: the old image
+                // stays on screen and the reason goes to the log. A developer tool must
+                // not take the game down.
+                Err(err) => log::warn!("texture {handle} was not reloaded: {err}"),
+            }
+        }
+        reloaded
+    }
+
+    /// Reloads the texture the resource cache holds for `path`, keeping its handle.
+    ///
+    /// This is the cache-aware reload: it asks [`ResourceManager`] which handle `path`
+    /// maps to, so a game that loaded assets through [`RenderContext::load_texture`] can
+    /// name a file and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// [`GiochiError::InvalidArgument`] when the path is not cached, plus whatever the
+    /// texture reload reports. A failed reload evicts the cache entry so the next load
+    /// surfaces the real error.
+    pub fn reload_cached_texture(&mut self, path: &str) -> Result<TextureHandle, GiochiError> {
+        self.resources.reload_texture(&self.textures, path)
+    }
+
     /// Number of live textures.
     pub fn texture_count(&self) -> usize {
         self.textures.len()
+    }
+
+    /// Estimated video memory held by the live textures, in bytes.
+    ///
+    /// See [`TextureRegistry::estimated_vram_bytes`] for what "estimated" means.
+    pub fn texture_vram_bytes(&self) -> u64 {
+        self.textures.estimated_vram_bytes()
     }
 
     /// Name of the renderer backend the SDL actually opened.
@@ -442,6 +540,36 @@ impl RenderContext {
         dst: Rect,
         src: Rect,
     ) -> Result<(), GiochiError> {
+        self.draw_texture_tinted(texture, dst, src, Color::WHITE)
+    }
+
+    /// Queues a tinted texture copy; `dst` and `src` are in screen pixels.
+    ///
+    /// The tint is multiplied by each sampled pixel. Neighbouring copies of the same
+    /// texture remain in one batch, including copies with different tints.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use giochi_engine::{Color, Rect, RenderContext};
+    ///
+    /// # fn draw(renderer: &mut RenderContext, texture: u64) -> Result<(), giochi_engine::GiochiError> {
+    /// renderer.draw_texture_tinted(
+    ///     texture,
+    ///     Rect::new(10.0, 10.0, 32.0, 32.0),
+    ///     Rect::ZERO,
+    ///     Color::rgb(255, 128, 64),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn draw_texture_tinted(
+        &mut self,
+        texture: TextureHandle,
+        dst: Rect,
+        src: Rect,
+        tint: Color,
+    ) -> Result<(), GiochiError> {
         let Some(size) = self.textures.size(texture) else {
             return Err(GiochiError::InvalidHandle(texture));
         };
@@ -457,7 +585,7 @@ impl RenderContext {
         }
 
         self.batch
-            .push_quad(texture, rect_from_sdl(dst), src, size)?;
+            .push_quad_tinted(texture, rect_from_sdl(dst), src, size, tint)?;
         #[cfg(feature = "profiling")]
         self.counters.record_queued_sprite();
         Ok(())
@@ -544,8 +672,46 @@ impl RenderContext {
 
     /// Draws `sprite`, converting its world-space rectangle through the camera.
     pub fn draw_sprite(&mut self, sprite: &Sprite) -> Result<(), GiochiError> {
+        self.draw_sprite_tinted(sprite, Color::WHITE)
+    }
+
+    /// Draws a tinted `sprite` after converting its world-space rectangle through the camera.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use giochi_engine::{Color, RenderContext, Sprite};
+    ///
+    /// # fn draw(renderer: &mut RenderContext, texture: u64) -> Result<(), giochi_engine::GiochiError> {
+    /// let sprite = Sprite::new(texture, 20.0, 30.0, 16.0, 16.0);
+    /// renderer.draw_sprite_tinted(&sprite, Color::rgb(255, 200, 80))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn draw_sprite_tinted(&mut self, sprite: &Sprite, tint: Color) -> Result<(), GiochiError> {
         let dst = self.camera.world_rect_to_screen(sprite.world_rect());
-        self.draw_texture(sprite.texture, dst, Rect::ZERO)
+        self.draw_texture_tinted(sprite.texture, dst, Rect::ZERO, tint)
+    }
+
+    /// Draws a world-space sprite using a source rectangle in texture pixels.
+    ///
+    /// The destination is transformed by the camera and queued in the same order-
+    /// preserving batch as [`RenderContext::draw_sprite`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use giochi_engine::{Rect, RenderContext, Sprite};
+    ///
+    /// # fn draw(renderer: &mut RenderContext, texture: u64) -> Result<(), giochi_engine::GiochiError> {
+    /// let sprite = Sprite::new(texture, 20.0, 30.0, 16.0, 16.0);
+    /// renderer.draw_sprite_region(&sprite, Rect::new(16.0, 0.0, 16.0, 16.0))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn draw_sprite_region(&mut self, sprite: &Sprite, source: Rect) -> Result<(), GiochiError> {
+        let dst = self.camera.world_rect_to_screen(sprite.world_rect());
+        self.draw_texture(sprite.texture, dst, source)
     }
 
     /// Converts a world-space point to screen space with the current camera.
@@ -595,6 +761,34 @@ impl RenderContext {
 
     pub(crate) fn texture_creator(&self) -> TextureCreator<WindowContext> {
         self.canvas.texture_creator()
+    }
+
+    /// The raw canvas, for the UI backend.
+    ///
+    /// Crate-private on purpose: `sdl2::render::WindowCanvas` must never appear in a
+    /// public signature (R1), and the only thing that needs to bypass the batched
+    /// `draw_*` methods is egui's triangle submission, which cannot be expressed as
+    /// sprites.
+    #[cfg(feature = "devtools")]
+    pub(crate) fn canvas_mut(&mut self) -> &mut WindowCanvas {
+        &mut self.canvas
+    }
+}
+
+/// Whether `left` and `right` name the same file on disk.
+///
+/// The watcher reports canonical absolute paths while a texture was created from whatever
+/// string the game passed — usually a relative asset path. Comparing the raw strings means
+/// a reload never matches, so the comparison falls back to `canonicalize` when the cheap
+/// equality fails. Both are files the process already opened, so a failure to canonicalise
+/// is not an error worth reporting: the answer is simply "not the same file".
+fn same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 

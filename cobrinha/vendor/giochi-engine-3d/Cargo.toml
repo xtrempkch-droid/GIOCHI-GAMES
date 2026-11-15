@@ -1,33 +1,98 @@
 [package]
 name = "giochi-engine-3d"
 description = "GIOCHI-ENGINE 3D: OpenGL ES 2.0 renderer over EGL, parallel to the 2D engine"
-version = "0.2.2"
-edition = "2021"
-rust-version = "1.82"
-license = "MIT"
-authors = ["GIOCHI-SYSTEM contributors"]
-repository = "https://github.com/xtrempkch-droid/GIOCHI-SYSTEM"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.86"   # see the comment on the workspace value
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
-giochi-engine = { path = "../giochi-engine", version = "0.2.2", default-features = false }
-glow = "0.14"
-bytemuck = { version = "1", features = ["derive"] }
-tobj = "4"
-glam = "0.29"
-anyhow = "1.0"
-thiserror = "2.0"
-log = "0.4"
+# `default-features = false` is not an optimisation, it is what makes `sdl2-system`
+# reachable from a consumer. Cargo unions features across the whole graph, so a plain
+# `giochi-engine` dependency here silently re-enabled `giochi-engine`'s default
+# `sdl2-bundled` even when the caller asked for `--features sdl2-system`: `sdl2` ended
+# up with both `bundled` and `use-pkgconfig`, and `sdl2-sys` gives `bundled` priority,
+# so the build ran CMake and the cross-compile path died. The two SDL2 features are
+# forwarded below instead, and `default = ["sdl2-bundled"]` keeps the old behaviour for
+# callers who ask for nothing.
+giochi-engine = { path = "../giochi-engine", version = "0.5.0", default-features = false }
+rapier3d = { workspace = true, optional = true }
+# Phase 21 pendency: a HUD over the 3D scene. `egui` is the same version the 2D engine
+# uses, so a game that links both does not end up with two egui majors.
+egui = { workspace = true, optional = true }
+glow = { workspace = true }
+bytemuck = { workspace = true }
+tobj = { workspace = true }
+glam = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
 # Window, input and audio only. The 3D path never touches `sdl2::render`, which
 # belongs to the 2D renderer (ADR-037).
-sdl2 = { version = "0.38", default-features = false }
+sdl2 = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+env_logger = { workspace = true }
+
+[[bench]]
+name = "meshes_3d"
+harness = false
+
+[[example]]
+name = "cube_demo"
+path = "examples/cube_demo.rs"
+
+[[example]]
+name = "mini_fps"
+path = "examples/mini_fps.rs"
+
+[[example]]
+name = "ball_balance"
+path = "examples/ball_balance.rs"
+
+[[example]]
+name = "model_viewer"
+path = "examples/model_viewer.rs"
+
+# Phase 19. Needs a GL driver and the reload module, so it is not part of a plain
+# `cargo test` run.
+[[test]]
+name = "hot_reload_3d"
+required-features = ["hot_reload"]
 
 [features]
-default = []
-sdl2-bundled = ["sdl2/bundled"]
+# Compila o SDL2 do código-fonte — o padrão, e o que o CI usa em x86_64.
+default = ["sdl2-bundled"]
+sdl2-bundled = ["sdl2/bundled", "giochi-engine/sdl2-bundled"]
 # Usa o SDL2 do sistema via pkg-config. É o caminho para embarcado, cuja imagem
 # já traz o SDL2 com KMSDRM — e é o que permite cross-compilar para aarch64 sem
-# compilar uma segunda cópia da biblioteca.
+# compilar uma segunda cópia da biblioteca. Precisa de
+# `--no-default-features`, senão `sdl2-bundled` viaja junto e vence.
 sdl2-system = ["sdl2/use-pkgconfig", "giochi-engine/sdl2-system"]
 # Fase 15: contadores de draw calls/vértices no renderer 3D. Encaminha para a
 # feature homónima do core, que também liga o profiler e o overlay.
 profiling = ["giochi-engine/profiling"]
+# Fase 19: recompila shaders e recarrega malhas quando o arquivo muda. Encaminha
+# para o watcher do core (`notify`); sem esta feature o módulo `hot_reload` deste
+# crate não é compilado e o `RenderContext3D` não ganha campo nenhum.
+hot_reload = ["giochi-engine/hot_reload"]
+# Fase 24a: mundo físico 3D. Traz o Rapier 3D, que é o custo real (~2 MB) desta fase;
+# fica desligado por omissão para que o caminho 2D não o ligue (ADR-057).
+physics-3d = ["dep:rapier3d"]
+# Fase 21 (pendência): HUD por egui sobre GLES 2.0. Traz o `egui` mas nenhum backend
+# gráfico — o painter é este crate (ADR-059).
+hud = ["dep:egui"]
+
+# Phase 24b. The demo needs the world it demonstrates.
+# Phase 21 pendency: the HUD needs the egui painter to exist at all.
+[[test]]
+name = "hud_render"
+required-features = ["hud"]
+
+[[example]]
+name = "physics_3d_demo"
+path = "examples/physics_3d_demo.rs"
+required-features = ["physics-3d"]

@@ -1024,10 +1024,10 @@ limitado por fragmento é ele que libera; no X55 ele não tem o que liberar.
 
 | Comando | Para quê |
 | --- | --- |
-| `--quadro q.bmp` | desenha um quadro e sai (offscreen no PC) |
+| `--quadro q.bmp` | desenha um quadro e sai (offscreen no PC). Com `--quadros N` grava o **último** dos N — é o que permite capturar o que um cliente LAN desenhou depois de a corrida começar |
 | `--tamanho 640x480` | painel simulado **no PC**; no aparelho o KMSDRM ignora o pedido e usa o modo do painel, o que produz BMP inconsistente — capture no aparelho **sem** o `--tamanho` |
 | `--passos 1500` | adianta a simulação |
-| `--piloto` | o piloto artificial dirige durante os `--passos` |
+| `--piloto` | o piloto artificial dirige durante os `--passos` **e** os quadros do laço. Sem ele, `--quadros 1400` num aparelho headless desenha 1400 quadros com o carro parado na grade, porque não há controle nem teclado — e o `--json` sai com `largou: false` e `s` na posição de grade, como se a simulação não estivesse rodando |
 | `--tela corrida` | força uma tela |
 | `--mapa porto` | escolhe o mapa (`avenida`, `boavista`, `circuito`, `porto`, `salar`) |
 | `--dificuldade desafiante` | escolhe o modo (`facil`, `normal`, `dificil`, `desafiante`) |
@@ -1053,6 +1053,12 @@ limitado por fragmento é ele que libera; no X55 ele não tem o que liberar.
 `--quadro` com o overlay ligado sem tecla. `GIOCHI_MODELOS=<dir>` aponta para
 outro diretório de `.obj`; sem arquivo, o modelo embutido no binário é gravado
 num diretório temporário e carregado pelo **mesmo** `load_obj_mesh`.
+
+`GIOCHI_REDE_DEBUG=1` faz o **host** escrever, a cada envio de estado, o
+progresso de si mesmo e de cada cliente (`prog`, `pos`, `volta`). Sem esses
+números, "o cliente está em 1º" é afirmação sem prova — foi assim que um
+progresso absurdo do carro remoto passou despercebido, e é o que separa "a câmara
+não segue o meu carro" de "o meu carro nunca saiu da origem".
 
 `GIOCHI_SEM=carros,particulas,hud` desliga partes do quadro — e **só** essas três
 chaves existem, mais `aura` e `farol` (a poça de neon sob os carros e o cone do
@@ -1105,6 +1111,32 @@ pergunta.
 errada. Foi ele que mostrou o asfalto ausente com a malha tendo 2 560 vértices:
 o quadrilátero do chão estava com a ordem dos cantos invertida e o descarte de
 faces o removia em silêncio.
+
+### O piloto não dirigia no laço de quadros
+
+`--piloto` só era consultado no laço de `--passos`. Num `--quadros N` sem
+`--passos` — que é como se captura uma corrida em andamento num aparelho
+headless — a entrada vinha dos dispositivos, e sem controle nem teclado ela é
+nenhuma: o carro ficava parado **na grade** por mais quadros que passassem.
+
+O sintoma era confundível com "a simulação não está rodando":
+
+| `--teclas start --frames 400` | `s` | `velocidade` | `largou` | `progresso` |
+| --- | --- | --- | --- | --- |
+| antes | 959,0 (grade) | 0,0 | `false` | −3,0 |
+| depois | 104,3 | 82,0 | `true` | 104,3 |
+
+Pior no host de LAN: `--lan-host --piloto --frames N` servia um carro imóvel, e o
+cliente recebia snapshots de um carro que nunca saiu do lugar. Agora o host
+conduz (medido: `s = 200,7` em 500 quadros).
+
+A correção é uma linha no laço (`entrada = piloto::entrada(&corrida)` quando
+`o.piloto && Fase::Correndo`), e o teste está em
+`crates/ui-sdl/tests/piloto_nos_quadros.rs`: ele roda o **binário** de verdade e
+lê o `--json`, porque o defeito era a ligação e não a função — um teste de
+unidade de `piloto::entrada` passaria com o bug presente. O controle negativo
+(quadros 400 sem `--piloto`, `progresso` tem de continuar negativo) impede que o
+teste passe por outro motivo.
 
 ## `scripts/traco-voltas.mjs`: a linha do tempo das voltas
 
@@ -1391,16 +1423,71 @@ poças e feixes + partículas + HUD).
 | largada, volta, checkpoint, resultado | `Mensagem::Global` | **confiável-ordenado** (`laminar`) |
 | descoberta do lobby | mDNS `_giochi._udp.local.` | — |
 
-O snapshot reaproveita o `SnapshotInimigo` do protocolo sem mudá-lo: `hp`
-(u16) carrega o rumo quantizado em 65536 passos (0,0001 rad), `tipo` a
-velocidade e `fase_chefe` três bits de estado (no ar, derrapando, nitro). O
-cliente interpola entre as duas últimas amostras pelo caminho angular mais
-curto e **segura na ponta** quando a rede atrasa — extrapolar posição faz o
-carro atravessar a mureta e voltar.
+O snapshot usa os campos do `SnapshotInimigo`: `x`/`z` vão como `f32` (o
+mesmo tipo do campo), `hp` (u16) carrega o rumo quantizado em 65536 passos
+(0,0001 rad), `tipo` a velocidade e `fase_chefe` três bits de estado (no ar,
+derrapando, nitro). O cliente interpola entre as duas últimas amostras pelo
+caminho angular mais curto e **segura na ponta** quando a rede atrasa —
+extrapolar posição faz o carro atravessar a mureta e voltar.
+
+#### Cada jogador vê a própria câmera — e as próprias cores
+
+O cliente **não simula** o carro local: a posição dele vem no snapshot, é
+escrita em `corrida.carro` e é dela que a câmera, o FOV e as partículas do
+cliente leem. O host manda o `Input` de cada cliente para o carro daquele
+cliente, e cada cliente reporta a própria posição como centro do AOI — o
+`giochi-net` guarda uma câmera por cliente e filtra o snapshot por ela.
+
+A cor também é por **ponto de vista**: `CarroRede::cor_do_id(id, meu_id)` pinta
+de verde o carro que aquele lado está dirigindo (id 0 no host, o próprio id no
+cliente) e de cor de adversário todo o resto. Sem o `meu_id` a cor saía só do
+id: no cliente o carro do host aparecia verde de jogador, o carro do próprio
+cliente aparecia como adversário e as três IA apareciam cinza, embora o host as
+desenhe em magenta/ciano/âmbar — a mesma corrida tinha duas paletas e a tela do
+cliente parecia a do host.
 
 Como o `laminar` dá garantia por canal e o snapshot escuta na porta anunciada,
 o controle usa a **porta + 1**: um cliente deriva o endereço do único dado que
 o mDNS oferece.
+
+### O defeito que o cliente LAN tinha: meio mapa colapsado no eixo
+
+Sintoma do dono: *"quando se joga pela rede o host fica ok, o cliente tem bug
+visual e a câmera não fica independente para cada cliente, é como se todas as
+câmeras fossem somente do host"*.
+
+O `giochi-net` vendorizado quantizava a posição do snapshot em **centímetros
+`u16` sem sinal**: `quantizar(-1.0)` devolvia `0`. Funciona num mapa do
+primeiro quadrante (`giochi-tower`), e este jogo é centrado na origem — metade
+do mundo tem `x` ou `z` negativos. O carro do cliente caía em `(0, 0)`, a
+câmera dele ficava parada na origem (parecendo a do host, que larga perto dela),
+os carros remotos empilhavam nos eixos e o AOI era centrado no lugar errado,
+porque o cliente reporta a posição do próprio carro. O `hp`, que aqui carrega o
+rumo nos 16 bits, também era enviado só como byte baixo.
+
+O teste de ida e volta do crate não pegava porque só usava posição positiva e
+`hp` abaixo de 256. Correção no `vendor/giochi-net` (é **deste** vendor, não do
+upstream — ver a tabela de adições abaixo): `x`/`z` como `f32` e `hp` como
+`u16`, snapshot de 9 para 14 bytes, `VERSAO_PROTOCOLO` de 1 para 2 (host e
+cliente de builds diferentes passam a se recusar no handshake em vez de ler
+deslocado). Os testes novos usam `x`/`z` negativos e `hp` de 16 bits inteiros.
+
+Prova em dois processos, no mesmo PC:
+
+```bash
+SDL_VIDEODRIVER=offscreen ./target/release/giochi-neon-drift \
+  --lan-host --lan-porta 47911 --teclas start --piloto --passos 300 \
+  --frames 1400 --quadro /tmp/host.bmp --json &
+sleep 2
+SDL_VIDEODRIVER=offscreen ./target/release/giochi-neon-drift \
+  --lan-entrar 127.0.0.1:47911 --teclas acelerar \
+  --frames 800 --quadro /tmp/cliente.bmp --json
+```
+
+Antes: o `--json` do cliente trazia `"x":0.0,"z":0.0` e `"cam"` na origem,
+enquanto o host já estava a 270 m. Depois: o cliente anda com o próprio input
+(`"x":6.5,"z":266.5`, `"s":263`), a câmera dele é a 12 m do carro dele e o
+`"progresso"` acompanha o do host — não fica mais congelado em `-3.0`.
 
 ### O batimento que faltava
 
@@ -1455,6 +1542,19 @@ desta vez o crate 3D **mudou** — ao contrário da rodada anterior, em que o di
 do `giochi-engine-3d/` era vazio. O snapshot foi refeito por cópia de
 `giochi-engine/src`, `giochi-engine/tests`, `giochi-engine-3d/src` e
 `giochi-engine-3d/shaders`.
+
+## Correções **deste vendor** no `giochi-net`
+
+| Correção | Sintoma sem ela |
+| --- | --- |
+| snapshot com `x`/`z` em `f32` e `hp` em `u16` (`wire.rs`), `TAM_INIMIGO` 14, `VERSAO_PROTOCOLO` 2 | coordenada negativa vira `0`: metade do mapa colapsa nos eixos e o cliente fica com o carro na origem; o rumo perde os 8 bits altos |
+
+**Já propagado.** O defeito era do crate, não deste vendor: a correção subiu
+para o engine partilhado (`GIOCHI-ENGINE-3D/giochi-net`, entrada em
+`CHANGELOG.md` § "Não publicado") e para o `giochi-tower`, que também vendoriza
+o mesmo crate e desenhava a horda com essas coordenadas. As três cópias carregam
+o mesmo `wire.rs`; sem isso, a próxima sincronização do `vendor/` reintroduziria
+o `quantizar` sem sinal e o sintoma voltaria sem nenhum commit suspeito.
 
 ### Cinco adições que são **deste vendor**, não do upstream
 

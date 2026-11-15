@@ -46,18 +46,26 @@
 
 pub mod context;
 pub mod game;
+#[cfg(feature = "hot_reload")]
+pub mod hot_reload;
 pub mod math3d;
 pub mod mesh;
+pub mod particles;
+#[cfg(feature = "physics-3d")]
+pub mod physics;
 pub mod render3d;
 pub mod shader;
+#[cfg(feature = "hud")]
+pub mod ui;
 
 mod error;
 mod registry;
 
 pub use error::{Error3D, Result3D};
+pub use particles::BillboardParticleSystem;
 pub use render3d::{
     sanitise_scale, scaled_size, DirectionalLight, InstancedRenderer, MeshHandle, RenderContext3D,
-    ShaderHandle, Upscaler, MAX_SCALE, MIN_SCALE,
+    ShaderHandle, TextureHandle, Upscaler, MAX_SCALE, MIN_SCALE,
 };
 
 /// Semantic version of the crate, as declared in `Cargo.toml`.

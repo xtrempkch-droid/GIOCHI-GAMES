@@ -17,8 +17,9 @@
 
 use std::error::Error;
 
-use giochi_engine_3d::math3d::{Camera3D, Color3D, Mat4, Quat, Transform3D, Vec3};
 use giochi_engine_3d::context::{FrontFace, GlState};
+use giochi_engine_3d::math3d::{Camera3D, Color3D, Mat4, Quat, Transform3D, Vec3};
+use giochi_engine_3d::mesh::{StaticBatch, StaticBatchBuilder};
 use giochi_engine_3d::render3d::{MeshHandle, ShaderHandle};
 use giochi_engine_3d::shader::BuiltinShader;
 use giochi_engine_3d::{DirectionalLight, RenderContext3D};
@@ -31,6 +32,7 @@ use giochi_neon_drift_core::{COR_JOGADOR, CORES_ADVERSARIOS, NOME};
 
 use crate::efeitos::{self, Particulas, Tipo};
 use crate::malha::{self, Construtor};
+use crate::rede::CarroRede;
 use crate::vetor::{direcao_normalizada, misturar, somar, subtrair};
 use crate::video::{girar_ponto as girar_ponto_do_painel, girar_rect, Rotacao};
 
@@ -82,7 +84,15 @@ const CEU_SALAR: Color3D = Color3D::new(0.095, 0.110, 0.180, 1.0);
 // causa do ambiente — se um dia ela ficar mais clara, o sintoma é a chapa
 // chapada de §31 e a correção é a mesma: malha e cor próprias.
 const ASFALTO: Color3D = Color3D::new(0.155, 0.160, 0.215, 1.0);
-const ASFALTO_FAIXA: Color3D = Color3D::new(0.90, 0.94, 1.0, 1.0);
+/// Tint da faixa central **texturizada**.
+///
+/// A textura é branca no traço e quase preta no fundo; este tint é o que pinta
+/// o traço. Um pouco mais frio que o branco puro porque o pulso multiplica em
+/// cima — com 1,0 no pico o traço saturava e piscava.
+const FAIXA_PISTA: Color3D = Color3D::new(0.86, 0.92, 1.0, 1.0);
+
+/// Tint da grade de neon das fitas de advertência (ciano-magenta).
+const GRADE_NEON: Color3D = Color3D::new(0.45, 0.95, 1.0, 1.0);
 const GUIA_VERMELHA: Color3D = Color3D::new(0.95, 0.16, 0.30, 1.0);
 const GUIA_BRANCA: Color3D = Color3D::new(0.70, 0.74, 0.82, 1.0);
 const MURO: Color3D = Color3D::new(0.22, 0.23, 0.32, 1.0);
@@ -142,10 +152,133 @@ const POCA_LUZ: Color3D = Color3D::new(0.42, 0.36, 0.20, 0.42);
 /// permite posicionar HUD em pixels.
 const PROFUNDIDADE_HUD: f32 = 10.0;
 
+// ── véu das telas de texto ─────────────────────────────────
+//
+// O título e o resultado desenham texto claro sobre a cidade, e o céu da serra
+// chega a 39 de média: um texto de 5×7 de 2 px por ponto sobre um fundo de
+// luminância 39 não se lê num painel de 3,5" sob luz do dia. Um quad preto
+// translúcido de tela cheia separa as duas camadas sem esconder o mundo — o
+// jogador continua vendo a pista girar atrás do menu, que é o que dá vida à
+// tela de entrada.
+//
+// O valor não é escolha estética: 0,62 foi o que deixou o texto acima de 200 de
+// luminância contra um fundo abaixo de 45 em **todas** as cinco pistas
+// (`o_veu_do_menu_deixa_o_texto_longe_do_fundo` mede a razão).
+
+/// Alfa do véu no título: o cenário fica visível, mas nunca compete com o texto.
+const VEU_TITULO: f32 = 0.62;
+/// Alfa do véu no resultado: mais leve que o do título.
+///
+/// Ali o jogador acabou de correr e o carro **deve** aparecer; o que precisa de
+/// contraste é só o bloco de três linhas, que já fica na metade de baixo.
+const VEU_RESULTADO: f32 = 0.50;
+/// Duração de uma transição completa do véu (0 → 1), em segundos.
+///
+/// A transição tem duas exigências que se opõem: **não piscar** (um salto de
+/// 0,62 para 0 num quadro, no instante do "JOGAR", cega) e **não atrasar** (um
+/// véu que ainda escurece quando o carro larga é o defeito original ao
+/// contrário). Por isso a rampa é de **taxa constante**, e não exponencial: a
+/// exponencial não garante nenhuma das duas — com constante de tempo pequena
+/// pula 0,26 no primeiro quadro, com constante grande leva 0,7 s para sumir.
+///
+/// 0,30 s dá 0,044 de alfa por quadro a 75 Hz (imperceptível como corte) e
+/// termina em 14 quadros do título para a corrida — antes de a contagem chegar
+/// ao fim.
+const DURACAO_VEU: f32 = 0.30;
+
+/// Alvo do véu para cada fase. `0,0` na corrida: a gameplay é a tela cheia.
+///
+/// `GIOCHI_VEU=0` desliga o véu. Existe para **medir**: sem A/B não dá para
+/// dizer "o texto ficou legível", só "eu gostei", e este arquivo tem uma regra
+/// de que afirmação sobre a imagem se mede (o mesmo motivo do `GIOCHI_CULL=0`).
+fn alvo_veu(fase: Fase) -> f32 {
+    if veu_desligado() {
+        return 0.0;
+    }
+    match fase {
+        Fase::Titulo => VEU_TITULO,
+        Fase::Resultado => VEU_RESULTADO,
+        Fase::Correndo => 0.0,
+    }
+}
+
+/// `GIOCHI_VEU=0` desliga o escurecimento das telas de texto.
+fn veu_desligado() -> bool {
+    use std::sync::OnceLock;
+    static DESLIGADO: OnceLock<bool> = OnceLock::new();
+    *DESLIGADO.get_or_init(|| {
+        std::env::var("GIOCHI_VEU").is_ok_and(|v| v.trim() == "0")
+    })
+}
+
+/// Um passo do véu em direção a `alvo`. Puro, para não precisar de GPU no teste.
+///
+/// Três propriedades que os testes cobram, e cada uma já foi um defeito em
+/// outro lugar deste arquivo:
+///
+/// - **`dt` negativo, zero ou `NaN` não move nada** e não produz `NaN`. Um
+///   `NaN` no alfa faz o driver descartar o quad de tela cheia, e o véu inteiro
+///   some sem erro nenhum.
+/// - **passo limitado por quadro**: no máximo `dt / DURACAO_VEU`, que é o que
+///   separa "transição" de "piscada".
+/// - **encaixe**: a diferença abaixo de 0,002 vira exatamente o alvo, senão o
+///   jogo paga um desenho de tela cheia por um resíduo invisível, para sempre.
+fn avancar_veu(atual: f32, alvo: f32, dt: f32) -> f32 {
+    let atual = if atual.is_finite() {
+        atual.clamp(0.0, 1.0)
+    } else {
+        alvo
+    };
+    let alvo = if alvo.is_finite() {
+        alvo.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if dt.is_nan() || dt <= 0.0 {
+        return atual;
+    }
+    let limite = dt / DURACAO_VEU;
+    let passo = (alvo - atual).clamp(-limite, limite);
+    let novo = atual + passo;
+    if (alvo - novo).abs() < 0.002 {
+        alvo
+    } else {
+        novo
+    }
+}
+
 /// Campo de visão horizontal base, em radianos (~74°).
 const FOV_BASE: f32 = 1.30;
 /// Campo de visão com nitro no máximo (~92°): é o que dá a sensação de velocidade.
 const FOV_NITRO: f32 = 1.62;
+
+// ── decalques de luz dos carros ────────────────────────────
+//
+// As medidas estão em metros e existem para a poça e o feixe não voltarem a
+// crescer por acidente: num painel de 720×1280 o decalque paga **cada pixel**,
+// e a rodada de 09/11 mediu 9,6 m de poça derrubando o quadro de 39 para 30 fps.
+
+/// Comprimento e largura da poça de neon sob o carro (elipse alinhada com ele).
+const POCA_COMPRIMENTO: f32 = 4.2;
+const POCA_LARGURA: f32 = 2.5;
+/// Altura dos decalques sobre o asfalto, para não brigarem com ele no z-buffer.
+const ALTURA_POCA: f32 = 0.02;
+const ALTURA_FEIXE: f32 = 0.03;
+/// Comprimento, largura e início do feixe do farol, à frente do para-choque.
+const FEIXE_COMPRIMENTO: f32 = 7.5;
+const FEIXE_LARGURA: f32 = 2.6;
+const INICIO_FEIXE: f32 = 5.5;
+/// Tempo de drift, em segundos, para o neon sob o carro chegar ao brilho máximo.
+///
+/// Existe para um toque de volante não piscar a poça como um drift de três
+/// segundos: a rampa curta é o que separa "o carro saiu de lado" de "o carro
+/// encostou no volante".
+const RAMPA_DRIFT: f32 = 0.45;
+/// Alfa da poça com o carro no piso e no auge do drift.
+const POCA_ALFA_BASE: f32 = 0.46;
+const POCA_ALFA_DRIFT: f32 = 0.86;
+/// Alfa do feixe no ponto quente (junto ao para-choque).
+const FEIXE_ALFA: f32 = 0.45;
 
 // ════════════════════════════════════════════════════════════
 // CENA
@@ -195,10 +328,21 @@ struct TexturasGpu {
     guarda: giochi_engine_3d::TextureHandle,
     painel: giochi_engine_3d::TextureHandle,
     xadrez: giochi_engine_3d::TextureHandle,
+    /// Faixa de pista: tracejado e duas linhas, POT 64 para mipmap/REPEAT.
+    faixa: giochi_engine_3d::TextureHandle,
+    /// Grade de neon das fitas de advertência das barreiras.
+    grade: giochi_engine_3d::TextureHandle,
+    /// Máscara de alfa da poça de neon sob os carros.
+    ///
+    /// Não é material: o RGB é branco e o desenho é o alfa (ver `texturas.rs`).
+    /// Por isso ela **não** entra em `todas()` e nunca é trocada por arquivo.
+    halo: giochi_engine_3d::TextureHandle,
+    /// Máscara de alfa do cone do farol projetado no asfalto.
+    cone: giochi_engine_3d::TextureHandle,
 }
 
 impl TexturasGpu {
-    /// Sobe as sete texturas de superfície, **de arquivo quando houver**.
+    /// Sobe as nove texturas de superfície, **de arquivo quando houver**.
     ///
     /// `GIOCHI_TEXTURAS=<dir>` faz o jogo procurar `<dir>/<nome>.<png|bmp|jpg|jpeg>`
     /// para cada material; o que não existir sai da receita procedural, como
@@ -220,7 +364,7 @@ impl TexturasGpu {
         if let Some(dir) = dir.as_deref() {
             if !dir.is_dir() {
                 eprintln!(
-                    "neon-drift: {} aponta para '{}', que não é diretório — usando as sete procedurais",
+                    "neon-drift: {} aponta para '{}', que não é diretório — usando as nove procedurais",
                     crate::texturas::VARIAVEL,
                     dir.display()
                 );
@@ -277,6 +421,22 @@ impl TexturasGpu {
             crate::texturas::LADO,
             crate::texturas::LADO
         );
+
+        // As duas máscaras de luz sobem fora do laço: elas não são materiais e
+        // não têm versão em arquivo (o porquê está em `texturas.rs`).
+        let halo_t = crate::texturas::halo_neon();
+        let cone_t = crate::texturas::cone_farol();
+        let halo = render.create_texture_from_rgba(halo_t.largura, halo_t.altura, &halo_t.pixels)?;
+        let cone = render.create_texture_from_rgba(cone_t.largura, cone_t.altura, &cone_t.pixels)?;
+        eprintln!(
+            "neon-drift: máscaras de luz '{}' e '{}' ({} x {}, {} bytes, só alfa)",
+            halo_t.nome,
+            cone_t.nome,
+            halo_t.largura,
+            halo_t.altura,
+            halo_t.bytes() + cone_t.bytes()
+        );
+
         Ok(Self {
             asfalto: handles[0],
             concreto: handles[1],
@@ -285,6 +445,10 @@ impl TexturasGpu {
             guarda: handles[4],
             painel: handles[5],
             xadrez: handles[6],
+            faixa: handles[7],
+            grade: handles[8],
+            halo,
+            cone,
         })
     }
 }
@@ -315,10 +479,13 @@ pub struct Cena3D {
     guarda_t: MeshHandle,
     xadrez_t: MeshHandle,
     painel_t: MeshHandle,
+    /// Faixa central da pista, texturizada (tracejado vem da textura).
+    faixas_t: MeshHandle,
+    /// Fita de advertência das barreiras, texturizada com a grade de neon.
+    grade_t: MeshHandle,
     /// Cubo pequeno para os fragmentos de colisão, instanciado.
     cubo: MeshHandle,
     asfalto: MeshHandle,
-    faixas: MeshHandle,
     guia_a: MeshHandle,
     guia_b: MeshHandle,
     muros: MeshHandle,
@@ -334,13 +501,21 @@ pub struct Cena3D {
     predios_b: MeshHandle,
     predios_c: MeshHandle,
     janelas: MeshHandle,
-    postes: MeshHandle,
-    luzes: MeshHandle,
     tunel: MeshHandle,
     tunel_luzes: MeshHandle,
     tunel_luzes_b: MeshHandle,
-    cones: MeshHandle,
     largada_b: MeshHandle,
+    /// Protótipo do poste/torre: um cubo unitário escalado por instância.
+    poste_proto: MeshHandle,
+    /// Protótipo do cone de obstáculo.
+    cone_proto: MeshHandle,
+    /// Portal de checkpoint, carregado por `load_obj_mesh`.
+    portal: MeshHandle,
+    /// Instâncias estáticas que a cena desenha com `draw_instanced`.
+    postes_inst: Vec<Mat4>,
+    luzes_inst: Vec<Mat4>,
+    cones_inst: Vec<Mat4>,
+    portais_inst: Vec<Mat4>,
 
     // ── carros ─────────────────────────────────────────────────
     corpo: MeshHandle,
@@ -372,6 +547,18 @@ pub struct Cena3D {
     instancias: Vec<Mat4>,
     /// Tempo acumulado, para animações (piscar do neon, tremor da câmera).
     tempo: f32,
+    /// Escurecimento das telas de texto, `0,0` (nada) a `1,0` (preto).
+    ///
+    /// Alvo por fase ([`alvo_veu`]) com atraso exponencial. Guardado como
+    /// **estado** e não calculado por fase porque a transição tem de ser vista:
+    /// um véu que aparece de um quadro para o outro pisca a tela no "JOGAR".
+    veu: f32,
+    /// `false` até o primeiro [`Cena3D::seguir`].
+    ///
+    /// No primeiro quadro o véu **salta** para o alvo em vez de deslizar: senão
+    /// um `--quadro` com `--tela corrida` sairia escurecido (a cena nasce com o
+    /// véu do título) e o diagnóstico mentiria sobre a imagem de produção.
+    veu_iniciado: bool,
     /// Luz do mundo, guardada para restaurar depois do HUD.
     luz_mundo: DirectionalLight,
     /// Cor do céu, que depende do cenário.
@@ -384,6 +571,25 @@ pub struct Cena3D {
     /// decai no núcleo, mas enquanto ele está acima do limiar o desenho o veria
     /// em vários quadros seguidos e soltaria destroços continuamente.
     ultimo_impacto: f32,
+    /// Carros da rede (clientes no host, todos no cliente).
+    carros_rede: Vec<CarroRede>,
+    /// `false` no cliente LAN: o carro local chega pelo snapshot, não da
+    /// `Corrida` simulada — desenhar os dois duplicaria o carro na tela.
+    desenhar_locais: bool,
+    /// Linhas do overlay F1 (vazio = oculto).
+    perfil: Vec<String>,
+    /// Aviso de LAN/menu no rodapé do HUD.
+    aviso_rede: Option<String>,
+    /// As linhas do menu do título, prontas: texto e "é a linha do cursor".
+    ///
+    /// Vazio é o caso do `--so` e do `--quadro` sem menu montado; aí o HUD cai
+    /// num cartão fixo. Quem monta as linhas é o `menu.rs`, que é puro — a cena
+    /// não sabe o que é "qualidade" nem "LAN", só desenha.
+    menu_linhas: Vec<(String, bool)>,
+    /// A frase de ajuda da linha do cursor.
+    menu_dica: String,
+    /// Quantas malhas estáticas vieram de um `StaticBatch` da engine.
+    batches: usize,
     // O contador de chamadas de desenho **não** mora aqui: quem conta é a
     // engine (`RenderContext3D::frame_counters`), no ponto em que a chamada é
     // emitida. Ver o comentário de `diagnostico` em `main.rs`.
@@ -402,6 +608,127 @@ impl Cena3D {
     /// Restringe o desenho a uma malha, pelo nome do diagnóstico.
     pub fn so(&mut self, nome: Option<String>) {
         self.so = nome;
+    }
+
+    /// Carros que chegaram pela rede, e se os carros da `Corrida` local devem
+    /// ser desenhados.
+    ///
+    /// No host, `desenhar_locais = true` (jogador + IA) e a lista traz os
+    /// clientes. No cliente, `false`: o carro local e os adversários chegam
+    /// todos como snapshot, e desenhar a `Corrida` local junto duplicaria os
+    /// mesmos carros em posições diferentes.
+    pub fn definir_carros_rede(&mut self, carros: Vec<CarroRede>, desenhar_locais: bool) {
+        self.carros_rede = carros;
+        self.desenhar_locais = desenhar_locais;
+    }
+
+    /// Linhas do overlay F1 (vazio desliga).
+    pub fn definir_perfil(&mut self, linhas: Vec<String>) {
+        self.perfil = linhas;
+    }
+
+    /// Aviso de LAN/menu no rodapé do HUD.
+    pub fn definir_aviso_rede(&mut self, aviso: Option<String>) {
+        self.aviso_rede = aviso.map(|a| a.to_uppercase());
+    }
+
+    /// As linhas do menu do título e a dica da linha do cursor.
+    ///
+    /// Vazio desliga o menu (diagnóstico `--so`); o HUD volta ao cartão fixo.
+    pub fn definir_menu(&mut self, linhas: Vec<(String, bool)>, dica: String) {
+        self.menu_linhas = linhas;
+        self.menu_dica = dica;
+    }
+
+    /// Quantas malhas estáticas a cena montou (diagnóstico).
+    pub fn batches(&self) -> usize {
+        self.batches
+    }
+
+    /// Libera **explicitamente** todas as malhas, texturas e shaders da cena.
+    ///
+    /// O `release_all` do renderer também faria isso, mas ele é uma rede de
+    /// segurança: o caminho normal tem de exercitar os `destroy_*` para que um
+    /// recurso esquecido apareça no `mesh_count`/`texture_count` durante o
+    /// desenvolvimento. No fim, a contagem é impressa; um número diferente de
+    /// zero é vazamento, não ruído.
+    pub fn destruir(&mut self, render: &mut RenderContext3D) {
+        let malhas = [
+            self.asfalto_t,
+            self.concreto_t,
+            self.pedra_t,
+            self.mata_t,
+            self.guarda_t,
+            self.xadrez_t,
+            self.painel_t,
+            self.faixas_t,
+            self.grade_t,
+            self.cubo,
+            self.asfalto,
+            self.guia_a,
+            self.guia_b,
+            self.muros,
+            self.neon,
+            self.neon_b,
+            self.reflexos,
+            self.poco_luz,
+            self.telhados,
+            self.longe,
+            self.morros,
+            self.predios_a,
+            self.predios_b,
+            self.predios_c,
+            self.janelas,
+            self.tunel,
+            self.tunel_luzes,
+            self.tunel_luzes_b,
+            self.largada_b,
+            self.poste_proto,
+            self.cone_proto,
+            self.portal,
+            self.corpo,
+            self.cabine,
+            self.rodas,
+            self.farois,
+            self.lanternas,
+            self.quad,
+        ];
+        for malha in malhas {
+            render.destroy_mesh(malha);
+        }
+        for malha in self.sprites.drain(..) {
+            render.destroy_mesh(malha);
+        }
+        for textura in [
+            self.texturas.asfalto,
+            self.texturas.concreto,
+            self.texturas.pedra,
+            self.texturas.mata,
+            self.texturas.guarda,
+            self.texturas.painel,
+            self.texturas.xadrez,
+            self.texturas.faixa,
+            self.texturas.grade,
+            self.texturas.halo,
+            self.texturas.cone,
+            self.atlas_t,
+        ] {
+            render.destroy_texture(textura);
+        }
+        render.destroy_shader(self.texturizado);
+        render.destroy_shader(self.sprite_shader);
+        render.destroy_shader(self.phong);
+        if let Some(inst) = self.instanciado.take() {
+            render.destroy_shader(inst);
+        }
+        render.release_all();
+        let restantes = (render.mesh_count(), render.texture_count(), render.shader_count());
+        if restantes != (0, 0, 0) {
+            eprintln!(
+                "neon-drift: AVISO — recursos restantes após destruir: {} malha(s), {} textura(s), {} shader(s)",
+                restantes.0, restantes.1, restantes.2
+            );
+        }
     }
 
     /// Monta a cena a partir da pista e do cenário do mapa.
@@ -429,10 +756,11 @@ impl Cena3D {
         let guarda_t = criar(render, &mundo.guarda_t)?;
         let xadrez_t = criar(render, &mundo.xadrez_t)?;
         let painel_t = criar(render, &mundo.painel_t)?;
+        let faixas_t = criar(render, &mundo.faixas_t)?;
+        let grade_t = criar(render, &mundo.grade_t)?;
         let cubo = render.create_cube_mesh(1.0)?;
 
         let asfalto = criar(render, &mundo.asfalto)?;
-        let faixas = criar(render, &mundo.faixas)?;
         let guia_a = criar(render, &mundo.guia_a)?;
         let guia_b = criar(render, &mundo.guia_b)?;
         let muros = criar(render, &mundo.muros)?;
@@ -447,20 +775,68 @@ impl Cena3D {
         let predios_b = criar(render, &mundo.predios_b)?;
         let predios_c = criar(render, &mundo.predios_c)?;
         let janelas = criar(render, &mundo.janelas)?;
-        let postes = criar(render, &mundo.postes)?;
-        let luzes = criar(render, &mundo.luzes)?;
         let tunel = criar(render, &mundo.tunel)?;
         let tunel_luzes = criar(render, &mundo.tunel_luzes)?;
         let tunel_luzes_b = criar(render, &mundo.tunel_luzes_b)?;
-        let cones = criar(render, &mundo.cones)?;
         let largada_b = criar(render, &mundo.largada_b)?;
 
         let carro = malha::carro();
-        let corpo = render.create_mesh(&carro.corpo.0, &carro.corpo.1)?;
+        // A lataria vem de `.obj` (com normais e triangulação garantidas pelo
+        // `load_obj` da engine). O modelo procedural fica como queda: um `obj`
+        // removido do pacote não pode deixar o jogo sem carro.
+        let corpo = match crate::modelos::caminho(crate::modelos::CARRO) {
+            Some(caminho) => match render.load_obj_mesh(&caminho) {
+                Ok(h) => {
+                    eprintln!(
+                        "neon-drift: lataria de '{}' ({} vértices)",
+                        caminho.display(),
+                        render.mesh_vertex_count(h)
+                    );
+                    h
+                }
+                Err(erro) => {
+                    eprintln!("neon-drift: OBJ da lataria recusado ({erro}); usando a procedural");
+                    render.create_mesh(&carro.corpo.0, &carro.corpo.1)?
+                }
+            },
+            None => render.create_mesh(&carro.corpo.0, &carro.corpo.1)?,
+        };
         let cabine = render.create_mesh(&carro.cabine.0, &carro.cabine.1)?;
         let rodas = render.create_mesh(&carro.rodas.0, &carro.rodas.1)?;
         let farois = render.create_mesh(&carro.farois.0, &carro.farois.1)?;
         let lanternas = render.create_mesh(&carro.lanternas.0, &carro.lanternas.1)?;
+
+        let poste_proto = render.create_cube_mesh(1.0)?;
+        let (cv, ci) = malha::cone(0.55, 1.0);
+        let cone_proto = render.create_mesh(&cv, &ci)?;
+        let portal = match crate::modelos::caminho(crate::modelos::PORTAL) {
+            Some(caminho) => match render.load_obj_mesh(&caminho) {
+                Ok(h) => {
+                    eprintln!(
+                        "neon-drift: portal de '{}' ({} vértices, instanciado nos checkpoints)",
+                        caminho.display(),
+                        render.mesh_vertex_count(h)
+                    );
+                    h
+                }
+                Err(erro) => {
+                    eprintln!("neon-drift: OBJ do portal recusado ({erro}); usando o fallback");
+                    let (pv, pi) = malha::portal_fallback();
+                    render.create_mesh(&pv, &pi)?
+                }
+            },
+            None => {
+                let (pv, pi) = malha::portal_fallback();
+                render.create_mesh(&pv, &pi)?
+            }
+        };
+        let batches = mundo.contagem_estaticas();
+        eprintln!(
+            "neon-drift: {batches} malha(s) estática(s) via StaticBatch; {} poste(s), {} cone(s), {} portal(is) instanciados",
+            mundo.postes_inst.len(),
+            mundo.cones_inst.len(),
+            mundo.portais_inst.len()
+        );
 
         let (qv, qi) = malha::quad();
         let quad = render.create_mesh(&qv, &qi)?;
@@ -557,9 +933,10 @@ impl Cena3D {
             guarda_t,
             xadrez_t,
             painel_t,
+            faixas_t,
+            grade_t,
             cubo,
             asfalto,
-            faixas,
             guia_a,
             guia_b,
             muros,
@@ -574,13 +951,17 @@ impl Cena3D {
             predios_b,
             predios_c,
             janelas,
-            postes,
-            luzes,
             tunel,
             tunel_luzes,
             tunel_luzes_b,
-            cones,
             largada_b,
+            poste_proto,
+            cone_proto,
+            portal,
+            postes_inst: mundo.postes_inst,
+            luzes_inst: mundo.luzes_inst,
+            cones_inst: mundo.cones_inst,
+            portais_inst: mundo.portais_inst,
             corpo,
             cabine,
             rodas,
@@ -599,9 +980,20 @@ impl Cena3D {
             malhas_efeito: Vec::with_capacity(1024),
             instancias: Vec::with_capacity(512),
             tempo: 0.0,
+            // Nasce com o véu do título porque é ali que a cena aparece na
+            // esmagadora maioria das vezes; `seguir` corrige no primeiro quadro.
+            veu: VEU_TITULO,
+            veu_iniciado: false,
             luz_mundo,
             so: None,
             ultimo_impacto: 0.0,
+            carros_rede: Vec::new(),
+            desenhar_locais: true,
+            perfil: Vec::new(),
+            aviso_rede: None,
+            menu_linhas: Vec::new(),
+            menu_dica: String::new(),
+            batches,
         })
     }
 
@@ -678,15 +1070,45 @@ impl Cena3D {
         //
         // Desenhado **primeiro**: o teste de profundidade resolve a ordem entre
         // opaco e opaco, e as superfícies texturizadas são todas opacas.
+        // `u_tint` dinâmico: o asfalto e a barreira pulsam em amplitudes
+        // diferentes. Custa um uniforme por desenho — nenhum pixel a mais, e é
+        // o que faz a pista parecer viva em vez de uma foto.
+        let pulso_asfalto = 0.93 + 0.07 * (self.tempo * 1.7).sin();
+        let pulso_barreira = 0.88 + 0.12 * (self.tempo * 2.6 + 1.0).sin();
+        // A faixa central respira no contratempo da barreira: dois pulsos
+        // iguais na mesma direção leem como um pisca-pisca só.
+        let pulso_faixa = 0.90 + 0.10 * (self.tempo * 2.6).sin();
         render.set_light(self.luz_mundo);
         for (nome, malha, textura, tint) in [
-            ("asfalto_t", self.asfalto_t, self.texturas.asfalto, ASFALTO),
+            (
+                "asfalto_t",
+                self.asfalto_t,
+                self.texturas.asfalto,
+                multiplicar(ASFALTO, pulso_asfalto),
+            ),
             ("concreto_t", self.concreto_t, self.texturas.concreto, CONCRETO),
             ("pedra_t", self.pedra_t, self.texturas.pedra, PEDRA),
             ("mata_t", self.mata_t, self.texturas.mata, MATA),
-            ("guarda_t", self.guarda_t, self.texturas.guarda, GUARDA_CORPO),
+            (
+                "guarda_t",
+                self.guarda_t,
+                self.texturas.guarda,
+                multiplicar(GUARDA_CORPO, pulso_barreira),
+            ),
             ("painel_t", self.painel_t, self.texturas.painel, PAINEL_NEON),
             ("xadrez_t", self.xadrez_t, self.texturas.xadrez, LARGADA_A),
+            (
+                "faixas_t",
+                self.faixas_t,
+                self.texturas.faixa,
+                multiplicar(FAIXA_PISTA, pulso_faixa),
+            ),
+            (
+                "grade_t",
+                self.grade_t,
+                self.texturas.grade,
+                multiplicar(GRADE_NEON, pulso_barreira),
+            ),
         ] {
             if self.quero(nome) && !self.desligado(parte_de_textura(nome)) {
                 // A ordem é a da engine 0.4.0: textura antes do modelo. Na 0.2.2 era
@@ -707,22 +1129,34 @@ impl Cena3D {
         render.set_light(self.luz_mundo);
         for (nome, malha, cor) in [
             ("asfalto", self.asfalto, ASFALTO),
-            ("faixas", self.faixas, ASFALTO_FAIXA),
             ("guia_a", self.guia_a, GUIA_VERMELHA),
             ("guia_b", self.guia_b, GUIA_BRANCA),
             ("muros", self.muros, MURO),
             ("predios_a", self.predios_a, PREDIO_A),
             ("predios_b", self.predios_b, PREDIO_B),
             ("predios_c", self.predios_c, PREDIO_C),
-            ("postes", self.postes, POSTE),
             ("tunel", self.tunel, TUNEL),
-            ("cones", self.cones, CONE),
             ("largada_b", self.largada_b, LARGADA_B),
             ("longe", self.longe, PREDIO_LONGE),
             ("morros", self.morros, MORRO),
         ] {
             if self.quero(nome) && !self.desligado(nome) {
                 render.draw_mesh_colored(malha, self.phong, &ident, &camera, cor)?;
+            }
+        }
+
+        // Postes e cones: **uma** chamada cada, independente de quantos são.
+        // Antes eles eram assados na malha do mundo; a geometria é idêntica e
+        // a única coisa que muda é a transformação, que é exatamente o caso de
+        // `draw_instanced`.
+        if let Some(inst) = self.instanciado {
+            for (nome, malha, instancias, cor) in [
+                ("postes", self.poste_proto, &self.postes_inst, POSTE),
+                ("cones", self.cone_proto, &self.cones_inst, CONE),
+            ] {
+                if self.quero(nome) && !self.desligado(nome) {
+                    render.draw_instanced(malha, inst, instancias, &camera, cor)?;
+                }
             }
         }
 
@@ -737,7 +1171,6 @@ impl Cena3D {
         render.set_light(EMISSIVO);
         for (nome, malha, cor) in [
             ("janelas", self.janelas, multiplicar(JANELA, tremula)),
-            ("luzes", self.luzes, multiplicar(LUZ_POSTE, pulso)),
             ("telhados", self.telhados, multiplicar(NEON_MAGENTA, pulso_b)),
             ("tunel_luzes", self.tunel_luzes, multiplicar(TUNEL_LUZ, pulso)),
             ("tunel_luzes_b", self.tunel_luzes_b, multiplicar(TUNEL_LUZ, pulso_b)),
@@ -748,6 +1181,27 @@ impl Cena3D {
         ] {
             if self.quero(nome) && !self.desligado(nome) {
                 render.draw_mesh_colored(malha, self.phong, &ident, &camera, cor)?;
+            }
+        }
+        // Refletores e portais de checkpoint: instanciados e emissivos.
+        if let Some(inst) = self.instanciado {
+            for (nome, malha, instancias, cor) in [
+                (
+                    "luzes",
+                    self.poste_proto,
+                    &self.luzes_inst,
+                    multiplicar(LUZ_POSTE, pulso),
+                ),
+                (
+                    "portais",
+                    self.portal,
+                    &self.portais_inst,
+                    multiplicar(NEON_CIANO, pulso_b),
+                ),
+            ] {
+                if self.quero(nome) && !self.desligado(nome) {
+                    render.draw_instanced(malha, inst, instancias, &camera, cor)?;
+                }
             }
         }
         render.set_light(self.luz_mundo);
@@ -782,8 +1236,33 @@ impl Cena3D {
     /// de prédios.
     pub fn seguir(&mut self, corrida: &Corrida, dt: f32) {
         self.tempo += dt;
+        self.atualizar_veu(corrida.fase, dt);
         self.atualizar_camera(corrida, dt);
         self.atualizar_particulas(corrida, dt);
+    }
+
+    /// Leva o véu até o alvo da fase corrente.
+    ///
+    /// Atraso exponencial, e não interpolação linear: a linear chega no fim com
+    /// velocidade zero e a exponencial sai rápido do começo, que é o que faz a
+    /// troca ler como "a tela clareou" e não como "algo se mexeu devagar".
+    fn atualizar_veu(&mut self, fase: Fase, dt: f32) {
+        let alvo = alvo_veu(fase);
+        if !self.veu_iniciado {
+            self.veu = alvo;
+            self.veu_iniciado = true;
+            return;
+        }
+        self.veu = avancar_veu(self.veu, alvo, dt);
+    }
+
+    /// O véu em vigor, para o `--json` e para os testes.
+    ///
+    /// Publicar isto é o que permite provar por script que a gameplay **não**
+    /// está escurecida: a diferença entre 0,0 e 0,62 não aparece numa contagem
+    /// de desenhos, só na imagem — ou neste número.
+    pub fn veu(&self) -> f32 {
+        self.veu
     }
 
     /// Posição da câmera, para o diagnóstico em `--json`.
@@ -829,13 +1308,19 @@ impl Cena3D {
         // junto, senão ela fica no nível do mar enquanto o carro está a 60 m e o
         // jogo vira uma vista aérea.
         let rapidez = (carro.velocidade / 62.0).clamp(0.0, 1.4);
-        let distancia = 7.4 + rapidez * 1.9;
-        let altura = carro.altura + 3.05 + rapidez * 0.35;
+        // Spring-arm: o braço da câmera estica com a velocidade e **mais** com
+        // o nitro. O alongamento no boost não é cosmético — é o que dá a
+        // leitura de "o carro disparou" sem desenhar um único pixel a mais.
+        let boost = if carro.nitro_usando { 1.0 } else { 0.0 };
+        let distancia = 7.4 + rapidez * 1.9 + boost * 1.1;
+        let altura = carro.altura + 3.05 + rapidez * 0.35 + boost * 0.18;
         let alvo_pos = Vec3::new(px - dx * distancia, altura, pz - dz * distancia);
         let alvo_mira = Vec3::new(px + dx * 7.0, carro.altura + 1.05, pz + dz * 7.0);
 
         // Atraso exponencial estável em qualquer `dt`: `1 - exp(-k·dt)` não
-        // estoura com quadro perdido, ao contrário de `k·dt`.
+        // estoura com quadro perdido, ao contrário de `k·dt`. É a integração
+        // de um mola-amortecedor criticamente amortecido, e é o que dá peso de
+        // perseguição em vez de a câmera colar no carro.
         let suavidade = 1.0 - (-8.5 * dt).exp();
         self.camera.pos = misturar(self.camera.pos, alvo_pos, suavidade);
         let suavidade_mira = 1.0 - (-11.0 * dt).exp();
@@ -917,47 +1402,84 @@ impl Cena3D {
             return Ok(());
         };
 
-        // O jogador primeiro: se um adversário passar por cima, o carro do
-        // jogador continua desenhado por cima dele.
-        let mut todos: Vec<Mat4> = Vec::with_capacity(corrida.adversarios.len() + 1);
-        let mut corpo_jogador: Vec<Mat4> = Vec::with_capacity(1);
-        corpo_jogador.push(self.matriz_do_jogador(&corrida.carro));
-        todos.push(corpo_jogador[0]);
+        // A lataria sai com `BuiltinShader::Phong`: é o único shader da engine
+        // que aplica o termo especular da luz, e é o que faz o neon da cidade
+        // correr pela tampa do carro. Como Phong é um desenho por malha (não
+        // tem variante instanciada), o corpo custa **uma chamada por carro**;
+        // vidro, rodas, faróis e lanternas continuam instanciados numa chamada
+        // cada, porque esses não precisam de brilho especular para ler.
+        let mut todos: Vec<Mat4> = Vec::with_capacity(corrida.adversarios.len() + self.carros_rede.len() + 1);
+        let mut corpos: Vec<(Transform3D, [f32; 3])> = Vec::with_capacity(todos.capacity());
+        let mut luzes: Vec<LuzDoCarro> = Vec::with_capacity(todos.capacity());
 
-        // Lataria dos adversários, agrupada por cor.
-        let mut por_cor: Vec<(usize, Vec<Mat4>)> = Vec::new();
-        for adversario in &corrida.adversarios {
-            // A altura do adversário vem da pista no `s` dele: um carro
-            // flutuando 40 m acima do asfalto na serra seria o defeito mais
-            // visível do mundo, e nada no desenho avisaria.
-            let m = self.matriz_do_carro(
-                adversario.posicao(&corrida.pista),
-                adversario.angulo(&corrida.pista),
-                corrida.pista.altura_em(adversario.s),
-            );
-            todos.push(m);
-            let cor = adversario.cor % CORES_ADVERSARIOS.len();
-            match por_cor.iter_mut().find(|(c, _)| *c == cor) {
-                Some((_, lista)) => lista.push(m),
-                None => por_cor.push((cor, vec![m])),
+        if self.desenhar_locais {
+            let transform = self.transform_do_jogador(&corrida.carro);
+            todos.push(transform.matrix());
+            corpos.push((transform, COR_JOGADOR));
+            luzes.push(LuzDoCarro {
+                base: transform.matrix(),
+                cor: COR_JOGADOR,
+                deriva: rampa_de_drift(corrida.carro.derrapando, corrida.carro.tempo_drift),
+                no_ar: corrida.carro.no_ar,
+            });
+
+            for adversario in &corrida.adversarios {
+                let transform = transform_de_carro(
+                    self.rotacao,
+                    adversario.posicao(&corrida.pista),
+                    adversario.angulo(&corrida.pista),
+                    corrida.pista.altura_em(adversario.s),
+                    0.0,
+                );
+                todos.push(transform.matrix());
+                let cor = CORES_ADVERSARIOS[adversario.cor % CORES_ADVERSARIOS.len()];
+                corpos.push((transform, cor));
+                // A IA não derrapa: ela segue a linha com oscilação lateral, que
+                // não abre ângulo. `deriva = 0` é o fato, não uma omissão.
+                luzes.push(LuzDoCarro {
+                    base: transform.matrix(),
+                    cor,
+                    deriva: 0.0,
+                    no_ar: false,
+                });
             }
         }
 
-        // Lataria: uma chamada por cor (1 do jogador + até 3 dos adversários).
-        let jogador = Color3D::new(COR_JOGADOR[0], COR_JOGADOR[1], COR_JOGADOR[2], 1.0);
-        render.draw_instanced(self.corpo, inst, &corpo_jogador, camera, jogador)?;
-        for (indice, lista) in &por_cor {
-            let c = CORES_ADVERSARIOS[*indice];
-            render.draw_instanced(
+        // Carros da rede: no host são os clientes; no cliente são todos,
+        // inclusive o próprio, porque o cliente **não** simula o carro local.
+        for carro in &self.carros_rede {
+            let transform = transform_de_carro(
+                self.rotacao,
+                carro.pos,
+                carro.angulo,
+                carro.altura,
+                0.0,
+            );
+            todos.push(transform.matrix());
+            corpos.push((transform, carro.cor));
+            luzes.push(LuzDoCarro {
+                base: transform.matrix(),
+                cor: carro.cor,
+                // O snapshot traz um **bit** de drift a 15 Hz, não a duração:
+                // inventar um relógio local dessincronizaria do host. Bit ligado
+                // = neon no auge.
+                deriva: if carro.derrapando { 1.0 } else { 0.0 },
+                no_ar: carro.no_ar,
+            });
+        }
+
+        render.set_light(self.luz_mundo);
+        for (transform, cor) in &corpos {
+            render.draw_mesh_colored(
                 self.corpo,
-                inst,
-                lista,
+                self.phong,
+                transform,
                 camera,
-                Color3D::new(c[0], c[1], c[2], 1.0),
+                Color3D::new(cor[0], cor[1], cor[2], 1.0),
             )?;
         }
 
-        // Peças de cor única: uma chamada para os quatro carros.
+        // Peças de cor única: uma chamada para todos os carros.
         for (malha, cor) in [
             (self.cabine, VIDRO),
             (self.rodas, PNEU),
@@ -969,56 +1491,82 @@ impl Cena3D {
             render.draw_instanced(malha, inst, &todos, camera, cor)?;
         }
 
-        // ── aura de neon sob os carros ───────────────────────
-        // Duas camadas porque não há textura nem gradiente: um quad só, opaco,
-        // virava uma poça de 5×8 m que cobria 40% do quadro (medido). A de
-        // dentro é pequena e forte, a de fora é o halo.
-        //
-        // O tamanho é medido em **pixels de tela**, não em metros: um quad
-        // deitado de 5×10 m visto a 3 m de altura cobre um terço do quadro, e
-        // como é translúcido ele paga cada pixel. Com 9,6 m de comprimento o
-        // jogo caiu de 39 para 30 fps. 4,2 m cabe sob o carro, que é o que a
-        // aura deve iluminar.
-        self.instancias.clear();
-        for m in todos.iter() {
-            self.instancias.push(achatar(*m, 2.5, 4.2, 0.02));
-        }
-        render.draw_instanced(
-            self.quad,
-            inst,
-            &self.instancias,
-            camera,
-            Color3D::new(jogador.r * 0.55, jogador.g * 0.55, jogador.b * 0.55, 0.42),
-        )?;
-
-        // ── feixe de farol no asfalto ────────────────────────
-        // Um quad comprido à frente de cada carro, translúcido. É o que faz o
-        // carro "abrir" a pista à noite; sem ele o farol ilumina a lataria e
-        // não o chão.
-        self.instancias.clear();
-        for m in &todos {
-            self.instancias.push(feixe(*m));
-        }
-        render.draw_instanced(
-            self.quad,
-            inst,
-            &self.instancias,
-            camera,
-            Color3D::new(0.72, 0.84, 1.0, 0.16),
-        )?;
+        self.desenhar_luz_dos_carros(render, camera, &luzes)?;
         Ok(())
     }
 
-    fn matriz_do_carro(&self, pos: Ponto, angulo: f32, altura: f32) -> Mat4 {
-        matriz_de_carro(self.rotacao, pos, angulo, altura)
+    /// A luz que os carros jogam no asfalto: a poça de neon e o cone do farol.
+    ///
+    /// ## Por que textura, e não cor chapada
+    ///
+    /// Até aqui eram dois quads de cor sólida: a poça era um retângulo de borda
+    /// dura (o comentário antigo falava em "duas camadas" justamente porque não
+    /// havia gradiente) e o feixe, uma faixa azul de largura constante que lia
+    /// como fita adesiva no chão. As máscaras de alfa do `texturas.rs` fazem o
+    /// **mesmo** quad desenhar luz: nenhum pixel a mais, e o custo por pixel é o
+    /// mesmo de antes. O que a mudança cobra é chamada de desenho — uma por cor
+    /// de carro na poça, uma para todos no feixe; o número medido está no README
+    /// ("O que custa", em *A luz que os carros jogam no chão*).
+    ///
+    /// ## Por que agrupado por cor
+    ///
+    /// `draw_instanced_textured` tem um `u_tint` por lote, e cada carro tem a
+    /// sua cor. Ver [`agrupar_por_tinta`].
+    ///
+    /// ## No ar, nada
+    ///
+    /// A poça e o feixe são decalques colados no chão. Com o carro saltando, um
+    /// decalque embaixo dele fica no asfalto sem emissor e lê como sombra
+    /// errada — e sombra de luz é o defeito mais visível que existe num jogo
+    /// noturno.
+    fn desenhar_luz_dos_carros(
+        &mut self,
+        render: &mut RenderContext3D,
+        camera: &Camera3D,
+        luzes: &[LuzDoCarro],
+    ) -> Result<(), Box<dyn Error>> {
+        if !self.desligado("aura") {
+            let mut pocas = Vec::with_capacity(luzes.len());
+            for luz in luzes.iter().filter(|l| !l.no_ar) {
+                let tinta = tinta_da_poca(luz.cor, luz.deriva, self.tempo);
+                let matriz = achatar(luz.base, POCA_LARGURA, POCA_COMPRIMENTO, ALTURA_POCA);
+                pocas.push((tinta, matriz));
+            }
+            for (tinta, matrizes) in agrupar_por_tinta(pocas) {
+                render.draw_instanced_textured(
+                    self.quad,
+                    self.sprite_shader,
+                    &matrizes,
+                    camera,
+                    self.texturas.halo,
+                    tinta,
+                )?;
+            }
+        }
+
+        if !self.desligado("farol") {
+            self.instancias.clear();
+            for luz in luzes.iter().filter(|l| !l.no_ar) {
+                self.instancias.push(feixe(luz.base));
+            }
+            if !self.instancias.is_empty() {
+                // Farol é branco-frio para todos: a cor não identifica o carro,
+                // e um farol colorido leria como neon em vez de farol.
+                render.draw_instanced_textured(
+                    self.quad,
+                    self.sprite_shader,
+                    &self.instancias,
+                    camera,
+                    self.texturas.cone,
+                    Color3D::new(0.82, 0.91, 1.0, FEIXE_ALFA),
+                )?;
+            }
+        }
+        Ok(())
     }
 
-    /// Matriz do carro do jogador, com o empinamento do salto.
-    ///
-    /// A inclinação vem de `atan2(v_vertical, velocidade)`: subindo a 11 m/s a
-    /// 60, o nariz aponta ~10° para cima; caindo, para baixo. Fora do ar a
-    /// velocidade vertical é zero e o resultado é o de sempre.
-    fn matriz_do_jogador(&self, carro: &giochi_neon_drift_core::Carro) -> Mat4 {
+    /// Transformação do carro do jogador, com o empinamento do salto.
+    fn transform_do_jogador(&self, carro: &giochi_neon_drift_core::Carro) -> Transform3D {
         let inclinacao = if carro.no_ar {
             carro
                 .velocidade_vertical
@@ -1026,7 +1574,7 @@ impl Cena3D {
         } else {
             0.0
         };
-        matriz_de_carro_inclinado(
+        transform_de_carro(
             self.rotacao,
             carro.pos,
             carro.angulo,
@@ -1269,16 +1817,22 @@ impl Cena3D {
         let largura = projeto.0 as f32;
         let altura = projeto.1 as f32;
 
-        match corrida.fase {
-            Fase::Titulo => self.hud_titulo(
+        // ── véu das telas de texto ──────────────────────────────
+        // **Antes** do texto e **depois** do mundo: é o que separa as duas
+        // camadas sem esconder a cidade. Tem de ser `tela_cheia` e não
+        // `retangulo(0, 0, largura, altura)`: pela `hud_matriz` esse retângulo
+        // cobre só o quarto central da tela (ver `hud_matriz_tela`).
+        if self.veu > 0.002 {
+            self.tela_cheia(
                 render,
                 inst,
                 &camera,
-                largura,
-                altura,
-                corrida.mapa,
-                corrida.dificuldade,
-            )?,
+                Color3D::new(0.0, 0.0, 0.0, self.veu),
+            )?;
+        }
+
+        match corrida.fase {
+            Fase::Titulo => self.hud_titulo(render, inst, &camera, largura, altura, corrida)?,
             Fase::Correndo => self.hud_corrida(render, inst, &camera, corrida, largura, altura)?,
             Fase::Resultado => self.hud_resultado(render, inst, &camera, corrida, largura, altura)?,
         }
@@ -1286,12 +1840,57 @@ impl Cena3D {
         // Linhas de velocidade por cima de tudo: é o "rastro" do nitro.
         self.hud_linhas_de_velocidade(render, inst, &camera, corrida, largura, altura)?;
         self.hud_raios_de_velocidade(render, inst, &camera, corrida, largura, altura)?;
-        self.hud_flash_de_nitro(render, inst, &camera, corrida, largura, altura)?;
+        self.hud_flash_de_nitro(render, inst, &camera, corrida)?;
+        self.hud_perfil(render, inst, &camera, largura, altura)?;
 
         render.set_light(self.luz_mundo);
         Ok(())
     }
 
+    /// Overlay F1 e o rodapé de LAN/menu, ambos em 3D (ADR-037).
+    fn hud_perfil(
+        &mut self,
+        render: &mut RenderContext3D,
+        inst: ShaderHandle,
+        camera: &Camera3D,
+        largura: f32,
+        altura: f32,
+    ) -> Result<(), Box<dyn Error>> {
+        let escala = (largura / 420.0).clamp(1.2, 2.2);
+        let mut y = 8.0;
+        let linhas = self.perfil.clone();
+        for linha in linhas {
+            self.texto(render, inst, camera, &linha, 8.0, y, escala, NEON_CIANO)?;
+            y += escala * 10.0;
+        }
+        if let Some(aviso) = self.aviso_rede.clone() {
+            let escala_aviso = (largura / 560.0).clamp(1.1, 1.8);
+            let largura_texto = fonte::largura_texto(&aviso) as f32 * escala_aviso;
+            let x = (largura - largura_texto - 8.0).max(8.0);
+            self.texto(
+                render,
+                inst,
+                camera,
+                &aviso,
+                x,
+                altura - escala_aviso * 10.0,
+                escala_aviso,
+                NEON_MAGENTA,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Tela de título: o menu, e o cartão de controles.
+    ///
+    /// Desenha as linhas que o `menu.rs` montou. A cena não decide nada: se a
+    /// linha é o mapa ou a qualidade, se está selecionada, o que o A faz nela —
+    /// tudo isso chega pronto em `self.menu_linhas`, e a única coisa que a cena
+    /// sabe é que a linha marcada vai em cor quente e maior.
+    ///
+    /// Sem menu montado (diagnóstico `--so`, ou um `--quadro` sem laço) cai no
+    /// cartão fixo com mapa e dificuldade, que é o que existia antes — um
+    /// título em branco mentiria sobre o estado do jogo.
     fn hud_titulo(
         &mut self,
         render: &mut RenderContext3D,
@@ -1299,8 +1898,7 @@ impl Cena3D {
         camera: &Camera3D,
         largura: f32,
         altura: f32,
-        mapa: &giochi_neon_drift_core::mapa::Mapa,
-        dificuldade: giochi_neon_drift_core::dificuldade::Dificuldade,
+        corrida: &Corrida,
     ) -> Result<(), Box<dyn Error>> {
         let escala = (largura / 200.0).clamp(2.0, 5.0);
         let titulo = fonte::largura_texto(NOME) as f32 * escala;
@@ -1310,7 +1908,7 @@ impl Cena3D {
             camera,
             NOME,
             (largura - titulo) * 0.5,
-            altura * 0.20,
+            altura * 0.10,
             escala,
             NEON_CIANO,
         )?;
@@ -1322,85 +1920,109 @@ impl Cena3D {
             camera,
             "CORRIDA NOTURNA ARCADE",
             (largura - sub) * 0.5,
-            altura * 0.20 + escala * 10.0,
+            altura * 0.10 + escala * 9.0,
             escala * 0.45,
             NEON_MAGENTA,
         )?;
 
-        // O mapa escolhido aparece **na tela**, com o nome: um mapa que só se
-        // alcança por `--mapa` não existe para quem joga no aparelho.
-        let escolhido = format!("MAPA  {}", mapa.nome.to_uppercase());
-        let w = fonte::largura_texto(&escolhido) as f32 * (escala * 0.5);
-        self.texto(
-            render,
-            inst,
-            camera,
-            &escolhido,
-            (largura - w) * 0.5,
-            altura * 0.20 + escala * 20.0,
-            escala * 0.5,
-            Color3D::new(0.55, 1.0, 0.75, 1.0),
-        )?;
+        // O pulso do cursor é o mesmo truque do neon da cidade: custa um
+        // uniforme e é o que diz "esta linha é a sua".
+        let pulso = 0.72 + 0.28 * (self.tempo * 5.0).sin();
+        let linha_altura = (escala * 0.62).clamp(1.6, 3.4);
+        let mut y = altura * 0.26;
 
-        // A dificuldade fica ao lado do mapa pela mesma razão dele: o que só se
-        // alcança por `--dificuldade` não existe para quem joga no aparelho.
-        // E "desafiante" precisa dizer **por que** é difícil, senão o jogador
-        // sente o carro lento e chama de bug.
-        let modo = format!(
-            "{}  {}",
-            dificuldade.nome().to_uppercase(),
-            dificuldade.descricao().to_uppercase()
-        );
-        let w = fonte::largura_texto(&modo) as f32 * (escala * 0.42);
-        self.texto(
-            render,
-            inst,
-            camera,
-            &modo,
-            (largura - w) * 0.5,
-            altura * 0.20 + escala * 27.0,
-            escala * 0.42,
-            Color3D::new(0.95, 0.72, 1.0, 1.0),
-        )?;
+        if self.menu_linhas.is_empty() {
+            // Cartão fixo: sem menu, o estado tem de continuar legível.
+            for (texto, cor) in [
+                (
+                    format!("MAPA  {}", corrida.mapa.nome.to_uppercase()),
+                    NEON_CIANO,
+                ),
+                (
+                    corrida.dificuldade.nome().to_uppercase(),
+                    Color3D::new(0.95, 0.72, 1.0, 1.0),
+                ),
+            ] {
+                let w = fonte::largura_texto(&texto) as f32 * linha_altura;
+                self.texto(
+                    render,
+                    inst,
+                    camera,
+                    &texto,
+                    (largura - w) * 0.5,
+                    y,
+                    linha_altura,
+                    cor,
+                )?;
+                y += linha_altura * 12.0;
+            }
+        } else {
+            // `mem::take` porque `self.texto` precisa de `&mut self` e as linhas
+            // moram em `self`: emprestar o vetor enquanto se desenha é o tipo de
+            // conflito que o compilador resolve e o programador não deve.
+            let linhas = std::mem::take(&mut self.menu_linhas);
+            for (texto, selecionada) in &linhas {
+                let cor = if *selecionada {
+                    Color3D::new(1.0, 0.94, 0.42, pulso)
+                } else {
+                    Color3D::new(0.74, 0.80, 0.92, 1.0)
+                };
+                let w = fonte::largura_texto(texto) as f32 * linha_altura;
+                self.texto(
+                    render,
+                    inst,
+                    camera,
+                    texto,
+                    (largura - w) * 0.5,
+                    y,
+                    linha_altura,
+                    cor,
+                )?;
+                y += linha_altura * 12.0;
+            }
+            self.menu_linhas = linhas;
+            let dica = std::mem::take(&mut self.menu_dica);
+            if !dica.is_empty() {
+                let dica_escala = linha_altura * 0.82;
+                let w = fonte::largura_texto(&dica) as f32 * dica_escala;
+                self.texto(
+                    render,
+                    inst,
+                    camera,
+                    &dica,
+                    (largura - w) * 0.5,
+                    y + linha_altura * 2.0,
+                    dica_escala,
+                    Color3D::new(0.55, 1.0, 0.75, 1.0),
+                )?;
+            }
+            self.menu_dica = dica;
+        }
 
-        let linhas = [
-            "WASD OU SETAS  VIRAR",
-            "ESPACO  FREIO DE MAO",
-            "SHIFT  NITRO",
-            "ESQ/DIR  MAPA   CIMA/BAIXO  DIFICULDADE",
-            "ENTER  JOGAR",
+        // Cartão de controles: **controle primeiro**, teclado depois. Este é um
+        // jogo de handheld, e a legenda tem de funcionar com o que o aparelho
+        // tem. As teclas continuam valendo, mas não são o caminho principal.
+        let controles = [
+            "ANALOGICO/DIRECIONAL VIRAR   A OU GATILHO ACELERAR",
+            "B OU GATILHO FREAR   L1/R1 DERRAPAR   L2/R2 NITRO",
+            "X OVERLAY   START JOGAR   Y VOLTAR",
         ];
-        let escala_corpo = (escala * 0.62).clamp(1.6, 3.4);
-        let mut y = altura * 0.52;
-        for linha in linhas {
-            let w = fonte::largura_texto(linha) as f32 * escala_corpo;
+        let escala_controles = linha_altura * 0.72;
+        let mut y = altura * 0.78;
+        for texto in controles {
+            let w = fonte::largura_texto(texto) as f32 * escala_controles;
             self.texto(
                 render,
                 inst,
                 camera,
-                linha,
+                texto,
                 (largura - w) * 0.5,
                 y,
-                escala_corpo,
-                Color3D::new(0.78, 0.84, 0.95, 1.0),
+                escala_controles,
+                Color3D::new(0.62, 0.68, 0.80, 1.0),
             )?;
-            y += escala_corpo * 11.0;
+            y += escala_controles * 10.0;
         }
-
-        // Pisca: é o que diferencia "instrução" de "espera por você".
-        let pisca = 0.55 + 0.45 * (self.tempo * 4.0).sin();
-        let dica = "ENTER PARA COMECAR";
-        let w = fonte::largura_texto(dica) as f32 * escala_corpo;
-        self.texto(
-            render,
-            inst,
-            camera,
-            dica,
-            (largura - w) * 0.5,
-            altura * 0.86,
-            escala_corpo,
-            Color3D::new(1.0, 0.95, 0.45, pisca),
-        )?;
         Ok(())
     }
 
@@ -1649,7 +2271,7 @@ impl Cena3D {
         }
 
         let pisca = 0.55 + 0.45 * (self.tempo * 4.0).sin();
-        let dica = "ENTER  REINICIAR";
+        let dica = "A OU START  REINICIAR";
         let wd = fonte::largura_texto(dica) as f32 * escala_corpo;
         self.texto(
             render,
@@ -1660,6 +2282,21 @@ impl Cena3D {
             altura * 0.82,
             escala_corpo,
             Color3D::new(1.0, 0.95, 0.45, pisca),
+        )?;
+        // A segunda saída, menor: reiniciar é o que o dedo procura, voltar ao
+        // menu é o que ele precisa quando o resultado foi ruim. Sem esta linha,
+        // o único caminho de volta seria matar o jogo.
+        let sair = "Y  VOLTAR AO MENU";
+        let ws = fonte::largura_texto(sair) as f32 * (escala_corpo * 0.8);
+        self.texto(
+            render,
+            inst,
+            camera,
+            sair,
+            (largura - ws) * 0.5,
+            altura * 0.90,
+            escala_corpo * 0.8,
+            Color3D::new(0.70, 0.76, 0.88, 1.0),
         )?;
         Ok(())
     }
@@ -1776,20 +2413,14 @@ impl Cena3D {
         inst: ShaderHandle,
         camera: &Camera3D,
         corrida: &Corrida,
-        largura: f32,
-        altura: f32,
     ) -> Result<(), Box<dyn Error>> {
         if corrida.fase != Fase::Correndo || !corrida.carro.nitro_usando {
             return Ok(());
         }
         let pulso = 0.55 + 0.45 * (self.tempo * 18.0).sin();
-        self.instancias.clear();
-        self.instancias
-            .push(hud_matriz(self.tela_hud(), 0.0, 0.0, largura, altura));
-        render.draw_instanced(
-            self.quad,
+        self.tela_cheia(
+            render,
             inst,
-            &self.instancias,
             camera,
             Color3D::new(0.35, 0.75, 1.0, 0.05 + 0.05 * pulso),
         )?;
@@ -1892,6 +2523,23 @@ impl Cena3D {
         Ok(())
     }
 
+    /// Preenche a **tela inteira** — o único caminho para véu e flash.
+    ///
+    /// Não use `retangulo(0, 0, largura, altura)` para isto: pela `hud_matriz`
+    /// esse retângulo cobre só o quarto central (ver `hud_matriz_tela`).
+    fn tela_cheia(
+        &mut self,
+        render: &mut RenderContext3D,
+        inst: ShaderHandle,
+        camera: &Camera3D,
+        cor: Color3D,
+    ) -> Result<(), Box<dyn Error>> {
+        self.instancias.clear();
+        self.instancias.push(hud_matriz_tela(self.tela_hud()));
+        render.draw_instanced(self.quad, inst, &self.instancias, camera, cor)?;
+        Ok(())
+    }
+
     /// Desenha um texto de 5×7 pontos em pixels de projeto.
     #[allow(clippy::too_many_arguments)]
     fn texto(
@@ -1905,7 +2553,13 @@ impl Cena3D {
         escala: f32,
         cor: Color3D,
     ) -> Result<(), Box<dyn Error>> {
-        let pontos = fonte::pontos(texto);
+        // Normaliza **aqui**, e não em cada chamador: a fonte não tem acento nem
+        // minúscula, e um texto que escape da normalização vira uma palavra com
+        // uma letra faltando — foi o que a dica de dificuldade fez ao chegar com
+        // "fábrica". O `para_ascii` troca caractere por caractere, então a
+        // medida que o chamador fez com `largura_texto` continua valendo.
+        let texto = fonte::para_ascii(texto);
+        let pontos = fonte::pontos(&texto);
         if pontos.is_empty() {
             return Ok(());
         }
@@ -1949,8 +2603,11 @@ struct Mundo {
     xadrez_t: Construtor,
     /// Outdoors e painéis de neon.
     painel_t: Construtor,
+    /// Faixa central da pista (tracejado na textura, não na geometria).
+    faixas_t: Construtor,
+    /// Fitas de advertência das barreiras (grade de neon).
+    grade_t: Construtor,
     asfalto: Construtor,
-    faixas: Construtor,
     guia_a: Construtor,
     guia_b: Construtor,
     muros: Construtor,
@@ -1965,13 +2622,62 @@ struct Mundo {
     predios_b: Construtor,
     predios_c: Construtor,
     janelas: Construtor,
-    postes: Construtor,
-    luzes: Construtor,
     tunel: Construtor,
     tunel_luzes: Construtor,
     tunel_luzes_b: Construtor,
-    cones: Construtor,
     largada_b: Construtor,
+    /// Instâncias estáticas: postes de rua, refletores, cones e portais.
+    ///
+    /// Ficam fora das malhas assadas porque `draw_instanced` desenha **uma
+    /// geometria** N vezes com uma chamada: é exatamente o caso de 20 postes
+    /// iguais. Assar cada um na malha do mundo trocaria uma chamada por 20.
+    postes_inst: Vec<Mat4>,
+    luzes_inst: Vec<Mat4>,
+    cones_inst: Vec<Mat4>,
+    portais_inst: Vec<Mat4>,
+}
+
+impl Mundo {
+    /// Quantas malhas estáticas não vazias o mundo produziu.
+    fn contagem_estaticas(&self) -> usize {
+        let texturizadas = [
+            &self.asfalto_t,
+            &self.concreto_t,
+            &self.pedra_t,
+            &self.mata_t,
+            &self.guarda_t,
+            &self.xadrez_t,
+            &self.painel_t,
+            &self.faixas_t,
+            &self.grade_t,
+        ];
+        let chapadas = [
+            &self.asfalto,
+            &self.guia_a,
+            &self.guia_b,
+            &self.muros,
+            &self.neon,
+            &self.neon_b,
+            &self.reflexos,
+            &self.poco_luz,
+            &self.telhados,
+            &self.longe,
+            &self.morros,
+            &self.predios_a,
+            &self.predios_b,
+            &self.predios_c,
+            &self.janelas,
+            &self.tunel,
+            &self.tunel_luzes,
+            &self.tunel_luzes_b,
+            &self.largada_b,
+        ];
+        texturizadas
+            .iter()
+            .chain(chapadas.iter())
+            .filter(|c| !c.vazio())
+            .count()
+    }
 }
 
 fn criar(render: &mut RenderContext3D, c: &Construtor) -> Result<MeshHandle, Box<dyn Error>> {
@@ -1981,7 +2687,16 @@ fn criar(render: &mut RenderContext3D, c: &Construtor) -> Result<MeshHandle, Box
         let (v, i) = malha::quad();
         return Ok(render.create_mesh(&v, &i)?);
     }
-    Ok(render.create_mesh(c.vertices(), c.indices())?)
+    // Todas as peças de um material já vêm concatenadas pelo `Construtor` do
+    // jogo; o `StaticBatchBuilder` da engine é quem compõe o modelo final. O
+    // ganho visível é o mesmo de antes (uma malha por material), mas agora a
+    // transformação de normal e a checagem de índice são as da engine — e o
+    // `StaticBatch` registra o resultado no mesmo `mesh_count`/`release_all`
+    // que todas as outras malhas.
+    let builder = StaticBatchBuilder::with_capacity(c.vertices().len(), c.indices().len())
+        .add_mesh(c.vertices(), c.indices(), &Mat4::IDENTITY)?;
+    let batch = StaticBatch::build(render, builder)?;
+    Ok(batch.mesh())
 }
 
 /// Gira um ponto do mundo para o espaço de projeto, **espelhando X**.
@@ -2048,6 +2763,21 @@ fn girar_ponto(rot: Rotacao, p: Ponto) -> (f32, f32) {
 /// centro dos faróis com `direcao()`. Quem inverter a malha no futuro quebra
 /// esse teste, e é assim que se sabe — antes desta rodada nenhuma das duas
 /// convenções estava afirmada, e o defeito passou por três sessões.
+/// Matriz de uma instância estática: escala → giro em Y → translação.
+///
+/// A ordem é a mesma de `Transform3D` da engine (ADR: escala, rotação,
+/// translação). Usar a mesma composição evita a peça sair no lugar certo no
+/// desenho individual e errado no instanciado.
+fn instancia(centro: [f32; 3], tamanho: [f32; 3], giro: f32) -> Mat4 {
+    Transform3D::new(
+        Vec3::new(centro[0], centro[1], centro[2]),
+        Quat::from_axis_angle(Vec3::UP, giro),
+        Vec3::new(tamanho[0], tamanho[1], tamanho[2]),
+    )
+    .matrix()
+}
+
+#[allow(dead_code)]
 fn matriz_de_carro(rot: Rotacao, pos: Ponto, angulo: f32, altura: f32) -> Mat4 {
     matriz_de_carro_inclinado(rot, pos, angulo, altura, 0.0)
 }
@@ -2058,6 +2788,7 @@ fn matriz_de_carro(rot: Rotacao, pos: Ponto, angulo: f32, altura: f32) -> Mat4 {
 /// cima. Em voo o carro tem de acompanhar a própria velocidade vertical: deitado
 /// ele parece flutuar, e num salto de 6 m isso é a diferença entre "pulou" e
 /// "está deslizando no ar".
+#[allow(dead_code)]
 fn matriz_de_carro_inclinado(
     rot: Rotacao,
     pos: Ponto,
@@ -2065,13 +2796,29 @@ fn matriz_de_carro_inclinado(
     altura: f32,
     inclinacao: f32,
 ) -> Mat4 {
+    transform_de_carro(rot, pos, angulo, altura, inclinacao).matrix()
+}
+
+/// A mesma composição da matriz, como `Transform3D`.
+///
+/// Existe porque o Phong é desenhado por `draw_mesh_colored`, que recebe
+/// `Transform3D`, e o resto do mundo (instâncias, HUD) trabalha com `Mat4`. As
+/// duas saem da mesma função para não divergirem: um carro desenhado pelo
+/// caminho instanciado e outro pelo Phong tinham de cair no mesmo lugar.
+fn transform_de_carro(
+    rot: Rotacao,
+    pos: Ponto,
+    angulo: f32,
+    altura: f32,
+    inclinacao: f32,
+) -> Transform3D {
     let (x, z) = girar_ponto(rot, pos);
     let angulo = girar_angulo(rot, angulo) + std::f32::consts::PI;
     // Yaw ∘ pitch: o `+ PI` alinha a frente desenhada com `direcao()` (ver
     // `matriz_de_carro`), e o pitch vem depois, no referencial do carro.
     let giro = Quat::from_axis_angle(Vec3::UP, angulo)
         * Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), inclinacao.clamp(-0.5, 0.5));
-    Transform3D::new(Vec3::new(x, altura, z), giro, Vec3::new(1.0, 1.0, 1.0)).matrix()
+    Transform3D::new(Vec3::new(x, altura, z), giro, Vec3::new(1.0, 1.0, 1.0))
 }
 
 fn girar_direcao(rot: Rotacao, p: Ponto) -> (f32, f32) {
@@ -2102,6 +2849,7 @@ fn construir_mundo(pista: &Pista, rotacao: Rotacao, cenario: Cenario) -> Mundo {
     // A pista é comum aos dois: asfalto, faixas, guias, mureta e a tira de neon.
     construir_pista(&mut m, pista, rotacao);
     construir_largada(&mut m, pista, rotacao);
+    construir_portais(&mut m, pista, rotacao);
     construir_cones(&mut m, pista, rotacao);
     construir_tunel(&mut m, pista, rotacao);
 
@@ -2172,7 +2920,7 @@ fn construir_pista(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
             let ar2 = (ax + anx * meia, az + anz * meia);
             let bl2 = (bx - bnx * meia, bz - bnz * meia);
             let br2 = (bx + bnx * meia, bz + bnz * meia);
-            m.faixas.chao3(
+            m.faixas_t.chao3(
                 [al2.0, al2.1],
                 [bl2.0, bl2.1],
                 [br2.0, br2.1],
@@ -2249,8 +2997,8 @@ fn construir_pista(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
             let dist = a.meia_largura + 2.4;
             for lado in [-1.0f32, 1.0] {
                 let (px, pz) = (ax + anx * dist * lado, az + anz * dist * lado);
-                m.faixas
-                    .caixa_girada([px, ya + 1.05, pz], [0.34, 0.22, 0.34], 0.0);
+                m.luzes_inst
+                    .push(instancia([px, ya + 1.05, pz], [0.34, 0.22, 0.34], 0.0));
             }
         }
 
@@ -2524,9 +3272,10 @@ fn construir_arcos(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
             &mut m.neon_b
         };
         malha.caixa_girada([px, y + 6.86, pz], [vao * 0.94, 0.13, 0.16], giro);
-        // E o lampião da viga, que ilumina a pista de verdade.
-        m.luzes
-            .caixa_girada([px, y + 6.62, pz], [vao * 0.55, 0.10, 0.10], giro);
+        // E o lampião da viga, que ilumina a pista de verdade — instanciado
+        // com as outras luzes.
+        m.luzes_inst
+            .push(instancia([px, y + 6.62, pz], [vao * 0.55, 0.10, 0.10], giro));
         indice_arco += 1;
     }
 }
@@ -2607,8 +3356,9 @@ fn construir_outdoors(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
         );
         m.neon_b.caixa_girada([bx, y + 10.7, bz], [8.2, 0.20, 0.14], giro);
         m.neon_b.caixa_girada([bx, y + 5.3, bz], [8.2, 0.20, 0.14], giro);
-        // Mastro, para a placa não flutuar.
-        m.postes.caixa_girada([bx, y + 4.0, bz], [0.26, 8.0, 0.26], giro);
+        // Mastro, para a placa não flutuar: instanciado com os outros postes.
+        m.postes_inst
+            .push(instancia([bx, y + 4.0, bz], [0.26, 8.0, 0.26], giro));
     }
 }
 
@@ -2683,8 +3433,10 @@ fn construir_cidade(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
             if indice % (passo * 2) == 0 {
                 let dp = a.meia_largura + 3.2;
                 let (lx, lz) = (px + nx * dp * lado, pz + nz * dp * lado);
-                m.postes.caixa_girada([lx, y + 3.4, lz], [0.22, 6.8, 0.22], 0.0);
-                m.luzes.caixa_girada([lx, y + 6.9, lz], [0.9, 0.28, 0.9], 0.0);
+                m.postes_inst
+                    .push(instancia([lx, y + 3.4, lz], [0.22, 6.8, 0.22], 0.0));
+                m.luzes_inst
+                    .push(instancia([lx, y + 6.9, lz], [0.9, 0.28, 0.9], 0.0));
                 // Poça de luz no asfalto: é o que faz o poste existir à noite.
                 // Sem ela, o lampião flutua e a rua continua preta embaixo dele.
                 let (qx, qz) = (
@@ -2739,8 +3491,9 @@ fn construir_barreiras(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
                 y,
                 1.0, // UV degenerado: a barreira é cor chapada, não textura de chão
             );
-            // Fita de advertência no topo: uma tira fina e brilhante por lado.
-            m.neon.chao3(
+            // Fita de advertência no topo: a grade de neon vai na textura, e o
+            // pulso do `u_tint` faz a fita correr — sem um vertex a mais.
+            m.grade_t.chao3(
                 [al.0, al.1],
                 [bl.0, bl.1],
                 [bl.0, bl.1],
@@ -2771,10 +3524,12 @@ fn construir_torres_de_luz(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
         }
         let (bx, bz) = (px + nx * distancia * lado, pz + nz * distancia * lado);
         let y = a.altura;
-        // Mastro de 18 m.
-        m.muros.caixa([bx, y + 9.0, bz], [0.7, 18.0, 0.7]);
-        // Painel de refletores no topo, virado para a pista.
-        m.neon_b.caixa([bx, y + 18.4, bz], [3.4, 1.1, 0.5]);
+        // Mastro de 18 m, instanciado com os postes.
+        m.postes_inst
+            .push(instancia([bx, y + 9.0, bz], [0.7, 18.0, 0.7], 0.0));
+        // Painel de refletores no topo, instanciado com as luzes.
+        m.luzes_inst
+            .push(instancia([bx, y + 18.4, bz], [3.4, 1.1, 0.5], 0.0));
     }
 }
 
@@ -2978,7 +3733,7 @@ fn construir_rampas(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
             let meia = pista.meia_largura_em(s) * 0.72;
             let (esq_x, esq_z) = (px - nx * meia, pz - nz * meia);
             let (dir_x, dir_z) = (px + nx * meia, pz + nz * meia);
-            m.faixas.chao3(
+            m.faixas_t.chao3(
                 [esq_x, esq_z],
                 [dir_x, dir_z],
                 [dir_x, dir_z],
@@ -2987,7 +3742,7 @@ fn construir_rampas(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
                 y + 0.03,
                 y + 0.03,
                 y + 0.03,
-                1.0,
+                6.0,
             );
         }
         // Fita no topo, na cor de advertência: é o ponto de mira do salto.
@@ -3117,14 +3872,38 @@ fn construir_cones(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
         let (x, z) = girar_ponto(rotacao, p);
         let y = pista.altura_em(obstaculo.s);
         let _ = tile;
-        m.cones.caixa(
+        m.cones_inst.push(instancia(
             [x, y + obstaculo.raio * 0.6, z],
             [
                 obstaculo.raio * 1.2,
                 obstaculo.raio * 1.2,
                 obstaculo.raio * 1.2,
             ],
-        );
+            0.0,
+        ));
+    }
+}
+
+/// Portais de checkpoint a cada quarto de volta.
+///
+/// A geometria é **uma** (`portal.obj`, instanciada): um anel e duas colunas por
+/// checkpoint, quatro por volta. Assar quatro portais numa malha por mapa
+/// gastaria a memória de um modelo para desenhar a mesma coisa quatro vezes.
+fn construir_portais(m: &mut Mundo, pista: &Pista, rotacao: Rotacao) {
+    let comprimento = pista.comprimento();
+    for i in 0..4 {
+        let s = pista.normalizar_s(comprimento * i as f32 / 4.0);
+        if pista.em_tunel(s) {
+            continue;
+        }
+        let p = pista.ponto_lateral(s, 0.0);
+        let (x, z) = girar_ponto(rotacao, p);
+        let (dx, dz) = girar_direcao(rotacao, pista.direcao_em(s));
+        let giro = dx.atan2(dz);
+        let y = pista.altura_em(s);
+        // O anel do OBJ tem o centro a 4,6 m; a base fica no asfalto.
+        m.portais_inst
+            .push(instancia([x, y, z], [1.0, 1.0, 1.0], giro));
     }
 }
 
@@ -3160,6 +3939,8 @@ fn parte_de_textura(nome: &str) -> &str {
         "mata_t" => "mata",
         "guarda_t" => "guarda",
         "painel_t" => "painel",
+        "faixas_t" => "faixas",
+        "grade_t" => "grade",
         outro => outro,
     }
 }
@@ -3182,14 +3963,26 @@ fn multiplicar(cor: Color3D, k: f32) -> Color3D {
 /// carro, que cobria 40% do quadro e não lia como luz no chão. Aqui o eixo Y do
 /// quad vira o eixo **frente** do carro (`-Z` local) e o eixo X vira a direita,
 /// o que deita o quad no asfalto.
-fn achatar(m: Mat4, largura: f32, comprimento: f32, y: f32) -> Mat4 {
+///
+/// `altura` é a altura **sobre o chão do carro**, não sobre o nível do mar. A
+/// diferença importa: a serra desce de 74 m, e um decalque cravado em `y = 0`
+/// fica enterrado sob o asfalto — some a poça e some o farol, sem erro nenhum.
+/// Quem já foi ao boavista viu um carro sem luz nenhuma embaixo.
+///
+/// A terceira coluna é o **normal**: ela leva o `+Z` do quad (a normal da
+/// malha) para `+Y`, e não para `+Z` do mundo. Errar isso não muda a posição
+/// (os quatro cantos têm `z = 0`), muda a **luz**: o `flat` e o `textured`
+/// calculam `0,35 + 0,65·lambert`, e com a normal apontando para o horizonte o
+/// fator travava em 0,54 — a poça saía 1,7× mais escura que o tint pedia, sem
+/// erro nenhum de GL. Ver `os_decalques_de_luz_apontam_para_cima`.
+fn achatar(m: Mat4, largura: f32, comprimento: f32, altura: f32) -> Mat4 {
     let d = m.data;
     // **Zero, não identidade.** A identidade deixa `m[1]` e `m[5]` em 1,0, e
     // esses dois campos são a componente Y dos eixos X e Y do quad: o resultado
     // é um cisalhamento de 1 m que inclina o quad para cima. Foi assim que a
     // aura do carro virou um painel vertical de 5 m em vez de uma poça no chão.
     let mut q = [0.0f32; 16];
-    q[10] = 1.0;
+    q[9] = 1.0;
     q[15] = 1.0;
     q[0] = d[0] * largura;
     q[2] = d[2] * largura;
@@ -3197,7 +3990,7 @@ fn achatar(m: Mat4, largura: f32, comprimento: f32, y: f32) -> Mat4 {
     q[4] = -d[8] * comprimento;
     q[6] = -d[10] * comprimento;
     q[12] = d[12];
-    q[13] = y;
+    q[13] = d[13] + altura;
     q[14] = d[14];
     Mat4::from_cols_array(&q)
 }
@@ -3310,22 +4103,109 @@ fn hud_matriz_girada(
 }
 
 /// Quad deitado à frente do carro, no chão: o feixe do farol.
+///
+/// É o [`achatar`] deslocado para a frente — mesma normal, mesmo achatamento.
+/// Antes esta função repetia a matriz inteira e por isso escapou da correção do
+/// normal: a poça apontava para cima e o feixe continuava apontando para o
+/// horizonte. Uma função, um lugar para errar.
 fn feixe(m: Mat4) -> Mat4 {
-    let d = m.data;
-    let mut q = [0.0f32; 16];
-    q[10] = 1.0;
-    q[15] = 1.0;
-    q[0] = d[0] * 2.6;
-    q[2] = d[2] * 2.6;
-    q[4] = -d[8] * 7.5;
-    q[6] = -d[10] * 7.5;
+    let mut q = achatar(m, FEIXE_LARGURA, FEIXE_COMPRIMENTO, ALTURA_FEIXE).to_cols_array();
     // 5,5 m à frente do para-choque, para o feixe não nascer debaixo do carro.
     // Curto de propósito: 15 m de feixe translúcido no chão custam ~8 fps neste
     // painel, e o que se ganha em alcance se perde em quadro.
-    q[12] = d[12] - d[8] * 5.5;
-    q[13] = 0.03;
-    q[14] = d[14] - d[10] * 5.5;
+    let d = m.data;
+    q[12] -= d[8] * INICIO_FEIXE;
+    q[14] -= d[10] * INICIO_FEIXE;
     Mat4::from_cols_array(&q)
+}
+
+/// O que cada carro joga de luz no chão.
+///
+/// Nasce no mesmo laço que monta a matriz do carro porque as três coisas de que
+/// a poça e o feixe precisam — matriz, cor e estado de drift — são lidas ali.
+struct LuzDoCarro {
+    /// Matriz do carro, de onde saem o decalque achatado e o feixe.
+    base: Mat4,
+    /// Cor do neon do carro.
+    cor: [f32; 3],
+    /// Rampa do drift: `0.0` é piso, `1.0` é o auge.
+    deriva: f32,
+    /// No ar o decalque sai: uma poça no chão sem emissor lê como sombra errada.
+    no_ar: bool,
+}
+
+/// Rampa do drift, `0.0..=1.0`.
+///
+/// O `tempo_drift` do núcleo é quanto o drift atual já dura. A rampa existe para
+/// um toque de volante não acender a poça como um drift de três segundos: em
+/// `RAMPA_DRIFT` segundos ela chega ao auge e fica lá enquanto o drift durar.
+/// Quando o drift acaba, o núcleo zera o tempo e a poça volta ao piso — de
+/// propósito, porque o fim do drift é informação, não um decaimento.
+fn rampa_de_drift(derrapando: bool, tempo_drift: f32) -> f32 {
+    if derrapando {
+        (tempo_drift / RAMPA_DRIFT).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Tinta da poça de neon de um carro: cor **e** alfa no mesmo `Color3D`.
+///
+/// O `u_tint` do desenho instanciado é um uniforme só; devolver as duas coisas
+/// juntas evita o estado intermediário em que a cor foi passada e o alfa
+/// esquecido.
+///
+/// O drift faz duas coisas, e as duas custam zero pixel:
+///
+/// 1. **acende** — o alfa sobe de [`POCA_ALFA_BASE`] para [`POCA_ALFA_DRIFT`];
+/// 2. **esquenta** — a cor puxa 40% para o branco, que é como neon saturado lê
+///    no talo. Sem isso o carro verde-limão e o adversário magenta ficariam
+///    ambos "mais fortes", indistinguíveis de um ganho de brilho da cena.
+///
+/// O pulso só existe durante o drift: parado, um neon que pisca vira pisca-pisca
+/// e o jogador procura um defeito no jogo.
+fn tinta_da_poca(cor: [f32; 3], deriva: f32, tempo: f32) -> Color3D {
+    // `NaN` não passa por `clamp` (devolve `NaN`), e `NaN` no tint é um quad
+    // que o driver pode descartar inteiro — some a poça de todos os carros, não
+    // só a de quem tinha o valor ruim. Piso é a resposta segura.
+    let deriva = if deriva.is_finite() {
+        deriva.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let pulso = if deriva > 0.0 {
+        0.92 + 0.08 * (tempo * 37.0).sin()
+    } else {
+        1.0
+    };
+    let quente = 0.40 * deriva;
+    Color3D::new(
+        cor[0] + (1.0 - cor[0]) * quente,
+        cor[1] + (1.0 - cor[1]) * quente,
+        cor[2] + (1.0 - cor[2]) * quente,
+        (POCA_ALFA_BASE + (POCA_ALFA_DRIFT - POCA_ALFA_BASE) * deriva).min(1.0) * pulso,
+    )
+}
+
+/// Agrupa as poças por tinta: **uma** chamada de desenho por cor distinta.
+///
+/// O desenho instanciado aplica um `u_tint` ao lote inteiro, e cada poça tem a
+/// cor do carro. Agrupar é o que faz dois carros da mesma cor custarem uma
+/// chamada em vez de duas — e, no caso comum (cores todas diferentes), mantém
+/// uma por carro, que é o mínimo possível com um uniforme por lote.
+///
+/// A ordem é a de chegada: o primeiro carro de cada cor define a posição do
+/// grupo. Ordem estável importa para o desenho translúcido, onde a mistura não é
+/// comutativa.
+fn agrupar_por_tinta(pocas: Vec<(Color3D, Mat4)>) -> Vec<(Color3D, Vec<Mat4>)> {
+    let mut grupos: Vec<(Color3D, Vec<Mat4>)> = Vec::new();
+    for (tinta, matriz) in pocas {
+        match grupos.iter_mut().find(|(t, _)| *t == tinta) {
+            Some((_, lista)) => lista.push(matriz),
+            None => grupos.push((tinta, vec![matriz])),
+        }
+    }
+    grupos
 }
 
 /// Matriz de um retângulo de HUD, posicionado em **pixels** da tela de projeto.
@@ -3348,6 +4228,38 @@ fn hud_matriz(tela: TelaHud, x: f32, y: f32, w: f32, h: f32) -> Mat4 {
         Vec3::new(
             (dw / tela.painel.0.max(1) as f32) * PROFUNDIDADE_HUD * aspecto,
             (dh / tela.painel.1.max(1) as f32) * PROFUNDIDADE_HUD,
+            1.0,
+        ),
+    )
+    .matrix()
+}
+
+/// Matriz de um quad que cobre a **tela inteira**, para véus e flashes.
+///
+/// ## Por que não dá para usar `hud_matriz` aqui
+///
+/// `hud_matriz` mapeia pixel → um espaço de HUD onde **1 px de projeto vale
+/// `PROF/painel` unidades**, ou seja, o *centro* de cada elemento cai no pixel
+/// certo, mas o *tamanho* sai pela metade: o NDC vai de -1 a +1 (duas unidades)
+/// e a escala dela entrega uma. Medido numa captura de 1024×768, um retângulo
+/// de tela cheia pela `hud_matriz` cobria 512×384 — o quarto central — em vez
+/// dos 1024×768. Passou despercebido porque o único uso era o flash de nitro,
+/// com alfa 0,05; o véu das telas de texto, opaco, expôs o erro.
+///
+/// Corrigir `hud_matriz` está fora de questão: todo o texto do HUD é
+/// dimensionado nesse espaço e dobrar a escala faria as linhas se sobreporem.
+/// Esta função existe só para quem precisa dos **cantos exatos** da tela.
+fn hud_matriz_tela(tela: TelaHud) -> Mat4 {
+    let aspecto = tela.painel.0 as f32 / tela.painel.1.max(1) as f32;
+    // A câmera do HUD abre 90° na vertical a `PROFUNDIDADE_HUD` de distância,
+    // então meia-altura visível = `PROFUNDIDADE_HUD` e meia-largura =
+    // `PROFUNDIDADE_HUD * aspecto`; o quad unitário precisa do dobro disso.
+    Transform3D::new(
+        Vec3::new(0.0, 0.0, -PROFUNDIDADE_HUD),
+        Quat::IDENTITY,
+        Vec3::new(
+            2.0 * PROFUNDIDADE_HUD * aspecto,
+            2.0 * PROFUNDIDADE_HUD,
             1.0,
         ),
     )
@@ -3404,6 +4316,7 @@ fn camara_hud(tela: (u32, u32)) -> Camera3D {
 mod testes {
     use super::*;
     use crate::vetor::produto_vetorial;
+    use giochi_neon_drift_core::Ponto as PontoCore;
 
     #[test]
     fn a_matriz_do_hud_mapeia_os_cantos_da_tela() {
@@ -3586,7 +4499,18 @@ mod testes {
     }
 
     #[test]
-    fn um_retangulo_do_tamanho_da_tela_cobre_o_ndc_inteiro() {
+    fn a_hud_matriz_dimensiona_pela_metade_do_pixel() {
+        // Armadilha que só apareceu na captura de tela: `hud_matriz` acerta o
+        // **centro** de qualquer retângulo no pixel pedido, mas o **tamanho**
+        // sai pela metade — o NDC vai de -1 a +1 (duas unidades) e a escala
+        // dela entrega uma. Um retângulo de "tela cheia" por ela cobre o quarto
+        // central: medido, 512×384 numa captura de 1024×768.
+        //
+        // O teste anterior "provava" a cobertura multiplicando por 2 no lugar
+        // de dividir, e passou por anos. Este afirma o valor real: 1,0 de NDC,
+        // meia tela. Não se corrige `hud_matriz` — todo o texto do HUD é
+        // calibrado nesse espaço e dobrá-lo faria as linhas se sobreporem.
+        // Tela cheia é `hud_matriz_tela`, testada logo abaixo.
         let tela = TelaHud {
             rotacao: Rotacao::Nenhuma,
             projeto: (640.0, 480.0),
@@ -3594,11 +4518,53 @@ mod testes {
         };
         let m = hud_matriz(tela, 0.0, 0.0, 640.0, 480.0);
         let aspecto = 640.0 / 480.0;
-        // Largura em NDC = escala_x / (PROF * aspecto) * 2
-        let largura_ndc = (m.data[0] / (PROFUNDIDADE_HUD * aspecto)) * 2.0;
-        let altura_ndc = (m.data[5] / PROFUNDIDADE_HUD) * 2.0;
-        assert!((largura_ndc - 2.0).abs() < 1e-4, "largura {largura_ndc}");
-        assert!((altura_ndc - 2.0).abs() < 1e-4, "altura {altura_ndc}");
+        // NDC = escala / (PROF · aspecto) na largura e escala / PROF na altura.
+        let largura_ndc = m.data[0] / (PROFUNDIDADE_HUD * aspecto);
+        let altura_ndc = m.data[5] / PROFUNDIDADE_HUD;
+        assert!((largura_ndc - 1.0).abs() < 1e-4, "largura {largura_ndc}");
+        assert!((altura_ndc - 1.0).abs() < 1e-4, "altura {altura_ndc}");
+    }
+
+    #[test]
+    fn a_matriz_de_tela_cheia_encosta_nos_quatro_cantos_do_ndc() {
+        // A prova que faltava: projetar os cantos do quad pela câmera do HUD de
+        // verdade (`view_projection`) e exigir ±1 nos dois eixos. Inclui o
+        // painel girado, onde a proporção vem do **painel** e não do projeto.
+        let casos = [
+            (Rotacao::Nenhuma, (640.0, 480.0), (640u32, 480u32)),
+            (Rotacao::Nenhuma, (1024.0, 768.0), (1024, 768)),
+            (Rotacao::Cw90, (1024.0, 768.0), (1024, 768)),
+            (Rotacao::Ccw90, (1024.0, 768.0), (1024, 768)),
+        ];
+        for (rotacao, projeto, painel) in casos {
+            let tela = TelaHud {
+                rotacao,
+                projeto,
+                painel,
+            };
+            let vp = camara_hud(painel).view_projection().expect("projeção");
+            let m = hud_matriz_tela(tela);
+            let mut vistos = Vec::new();
+            for (sx, sy) in [(-0.5, -0.5), (0.5, -0.5), (-0.5, 0.5), (0.5, 0.5)] {
+                let mundo = m.transform_point(Vec3::new(sx, sy, 0.0));
+                let ndc = vp.project_point(mundo).expect("canto atrás da câmera");
+                assert!(
+                    (ndc.x.abs() - 1.0).abs() < 1e-3,
+                    "{rotacao:?} {painel:?}: canto x={sx} sy={sy} em NDC {}",
+                    ndc.x
+                );
+                assert!(
+                    (ndc.y.abs() - 1.0).abs() < 1e-3,
+                    "{rotacao:?} {painel:?}: canto x={sx} sy={sy} em NDC {}",
+                    ndc.y
+                );
+                vistos.push((ndc.x.signum(), ndc.y.signum()));
+            }
+            // Um canto para cada quadrante: o quad está centrado e não torcido.
+            vistos.sort_by(|a, b| a.partial_cmp(b).expect("sem NaN"));
+            vistos.dedup();
+            assert_eq!(vistos.len(), 4, "{rotacao:?} {painel:?}: {vistos:?}");
+        }
     }
 
     #[test]
@@ -3616,6 +4582,11 @@ mod testes {
     fn o_quad_deitado_do_carro_fica_com_a_normal_para_cima() {
         // A aura e o feixe do farol são quads no chão. Normal para baixo + face
         // culling = efeito invisível, e o defeito não dá erro nenhum.
+        //
+        // Esta é a normal **geométrica** (produto vetorial dos dois eixos do
+        // decalque), a que decide o descarte de faces. A normal que o shader
+        // lê é outra coisa — é a terceira coluna da matriz —, e ela escapou
+        // desta conta por anos: ver `os_decalques_de_luz_apontam_para_cima`.
         for angulo in [0.0f32, 1.1, -2.3, 3.0] {
             let m = Transform3D::new(
                 Vec3::ZERO,
@@ -3647,7 +4618,7 @@ mod testes {
         //
         // Comparar com a malha em vez de com um comentário é o que faz este
         // teste valer: inverter os `z` de `malha::carro()` reprova aqui.
-        use giochi_neon_drift_core::{Carro, Ponto as PontoCore};
+        use giochi_neon_drift_core::Carro;
 
         let formas = malha::carro();
         // Centro dos faróis em espaço local (média dos vértices).
@@ -3770,6 +4741,323 @@ mod testes {
             z_farol < z_lanterna,
             "faróis em z={z_farol:.2} deviam estar à frente (mais -Z) das lanternas em z={z_lanterna:.2}"
         );
+    }
+
+    /// Aplica uma `Mat4` (coluna-maior) a um ponto 3D.
+    fn aplicar(m: &Mat4, p: [f32; 3]) -> [f32; 3] {
+        let d = m.data;
+        [
+            d[0] * p[0] + d[4] * p[1] + d[8] * p[2] + d[12],
+            d[1] * p[0] + d[5] * p[1] + d[9] * p[2] + d[13],
+            d[2] * p[0] + d[6] * p[1] + d[10] * p[2] + d[14],
+        ]
+    }
+
+    #[test]
+    fn os_decalques_de_luz_apontam_para_cima() {
+        // O `flat` e o `textured` da engine calculam `0,35 + 0,65·lambert`. A
+        // normal do quad da engine é `+Z`; se o decalque não a levar para `+Y`,
+        // ela fica no plano do chão e o fator trava em 0,54 — a poça sai 1,7×
+        // mais escura que o tint pediu, e **sem erro de GL**: o defeito é só uma
+        // luz fraca. Foi assim que o feixe ficou para trás quando a poça foi
+        // corrigida.
+        for angulo in [0.0f32, 0.6, 1.2, -0.9, 2.5, 3.0] {
+            let carro = matriz_de_carro(Rotacao::Nenhuma, PontoCore::ZERO, angulo, 0.0);
+            for (nome, m) in [
+                ("poça", achatar(carro, POCA_LARGURA, POCA_COMPRIMENTO, ALTURA_POCA)),
+                ("feixe", feixe(carro)),
+            ] {
+                let origem = aplicar(&m, [0.0, 0.0, 0.0]);
+                let normal = aplicar(&m, [0.0, 0.0, 1.0]);
+                let normal = [
+                    normal[0] - origem[0],
+                    normal[1] - origem[1],
+                    normal[2] - origem[2],
+                ];
+                assert!(
+                    normal[1] > 0.99,
+                    "{nome} com ângulo {angulo:.2}: normal {normal:?} — o decalque não está \
+                     deitado no chão"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_poca_cobre_o_carro_e_fica_no_chao() {
+        for angulo in [0.0f32, 0.7, 2.1, -1.3] {
+            let carro = matriz_de_carro(
+                Rotacao::Nenhuma,
+                PontoCore::new(20.0, -7.0),
+                angulo,
+                0.0,
+            );
+            let m = achatar(carro, POCA_LARGURA, POCA_COMPRIMENTO, ALTURA_POCA);
+
+            // Cantos do quad unitário (a malha é de -0,5 a +0,5 em X e Y).
+            let cantos = [
+                aplicar(&m, [-0.5, -0.5, 0.0]),
+                aplicar(&m, [0.5, -0.5, 0.0]),
+                aplicar(&m, [0.5, 0.5, 0.0]),
+                aplicar(&m, [-0.5, 0.5, 0.0]),
+            ];
+            for canto in cantos {
+                assert!(
+                    (canto[1] - ALTURA_POCA).abs() < 1e-5,
+                    "ângulo {angulo:.2}: canto a y = {} — o decalque saiu do chão",
+                    canto[1]
+                );
+            }
+
+            // A largura e o comprimento do decalque são os pedidos, medidos no
+            // mundo: é o que impede uma mudança de escala silenciosa (a poça de
+            // 9,6 m custou 9 fps numa rodada anterior).
+            let largura = ((cantos[1][0] - cantos[0][0]).powi(2)
+                + (cantos[1][2] - cantos[0][2]).powi(2))
+            .sqrt();
+            let comprimento = ((cantos[3][0] - cantos[0][0]).powi(2)
+                + (cantos[3][2] - cantos[0][2]).powi(2))
+            .sqrt();
+            assert!(
+                (largura - POCA_LARGURA).abs() < 1e-3,
+                "ângulo {angulo:.2}: largura {largura:.3} em vez de {POCA_LARGURA}"
+            );
+            assert!(
+                (comprimento - POCA_COMPRIMENTO).abs() < 1e-3,
+                "ângulo {angulo:.2}: comprimento {comprimento:.3} em vez de {POCA_COMPRIMENTO}"
+            );
+
+            // O centro do decalque é o do carro: a poça tem de estar **sob** ele,
+            // não à frente.
+            let centro = aplicar(&m, [0.0, 0.0, 0.0]);
+            let (cx, cz) = girar_ponto(
+                Rotacao::Nenhuma,
+                PontoCore::new(20.0, -7.0),
+            );
+            assert!((centro[0] - cx).abs() < 1e-4 && (centro[2] - cz).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn a_poca_acompanha_o_relevo_da_serra() {
+        // O boavista desce de 74 m. Um decalque cravado em `y = 0` fica enterrado
+        // sob o asfalto: some a poça e some o feixe, sem erro nenhum de GL — o
+        // sintoma é "esse mapa não tem luz embaixo do carro".
+        for altura in [0.0f32, 12.5, 74.0] {
+            let carro = matriz_de_carro(Rotacao::Nenhuma, PontoCore::ZERO, 0.3, altura);
+            let poca = achatar(carro, POCA_LARGURA, POCA_COMPRIMENTO, ALTURA_POCA);
+            let feixe = feixe(carro);
+            for (nome, m, esperado) in [
+                ("poça", poca, altura + ALTURA_POCA),
+                ("feixe", feixe, altura + ALTURA_FEIXE),
+            ] {
+                let centro = aplicar(&m, [0.0, 0.0, 0.0]);
+                assert!(
+                    (centro[1] - esperado).abs() < 1e-4,
+                    "{nome} a {altura} m: y = {:.3}, esperado {esperado:.3}",
+                    centro[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn o_feixe_comeca_a_frente_do_para_choque() {
+        // O feixe nasce 5,5 m à frente do carro. Nascer embaixo dele faria a luz
+        // atravessar a lataria, e o farol deixaria de "abrir" a pista.
+        let carro = matriz_de_carro(Rotacao::Nenhuma, PontoCore::ZERO, 0.0, 0.0);
+        let m = feixe(carro);
+        let centro = aplicar(&m, [0.0, 0.0, 0.0]);
+        let frente = {
+            let d = carro.data;
+            [-d[8], -d[10]]
+        };
+        let deslocamento = centro[0] * frente[0] + centro[2] * frente[1];
+        assert!(
+            (deslocamento - INICIO_FEIXE).abs() < 1e-4,
+            "o feixe começou a {deslocamento:.2} m do carro, não a {INICIO_FEIXE}"
+        );
+        assert!((centro[1] - ALTURA_FEIXE).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_rampa_do_drift_sobe_e_satura() {
+        assert_eq!(rampa_de_drift(false, 0.0), 0.0);
+        assert_eq!(rampa_de_drift(false, 5.0), 0.0, "parado, o tempo não importa");
+        assert_eq!(rampa_de_drift(true, 0.0), 0.0);
+        assert!(
+            (rampa_de_drift(true, RAMPA_DRIFT / 2.0) - 0.5).abs() < 1e-5,
+            "no meio da rampa o brilho devia estar na metade"
+        );
+        assert_eq!(rampa_de_drift(true, RAMPA_DRIFT), 1.0);
+        assert_eq!(rampa_de_drift(true, 60.0), 1.0, "a rampa tem teto");
+
+        let mut anterior = 0.0;
+        for passo in 0..20 {
+            let v = rampa_de_drift(true, RAMPA_DRIFT * passo as f32 / 10.0);
+            assert!(v >= anterior, "a rampa desceu de {anterior} para {v}");
+            anterior = v;
+        }
+    }
+
+    #[test]
+    fn o_drift_acende_e_esquenta_o_neon() {
+        let cor = COR_JOGADOR;
+        let parado = tinta_da_poca(cor, 0.0, 1.23);
+        let no_talo = tinta_da_poca(cor, 1.0, 1.23);
+
+        assert!(
+            no_talo.a > parado.a * 1.5,
+            "o drift devia acender a poça: alfa {:.2} contra {:.2}",
+            parado.a,
+            no_talo.a
+        );
+        assert!(no_talo.a <= 1.0 && parado.a > 0.0, "alfa fora de 0..1");
+
+        // "Esquenta": a distância até o branco diminui em **todos** os canais.
+        let distancia_ao_branco = |c: Color3D| {
+            (1.0 - c.r) + (1.0 - c.g) + (1.0 - c.b)
+        };
+        assert!(
+            distancia_ao_branco(no_talo) < distancia_ao_branco(parado),
+            "no auge do drift a cor devia puxar para o branco"
+        );
+
+        // Parado não pulsa: dois instantes, o mesmo alfa. Um neon que pisca com
+        // o carro parado lê como defeito.
+        assert_eq!(parado.a, tinta_da_poca(cor, 0.0, 9.87).a);
+        // Em drift pulsa.
+        assert_ne!(
+            no_talo.a,
+            tinta_da_poca(cor, 1.0, 1.30).a,
+            "em drift a poça devia pulsar"
+        );
+
+        // Entradas fora da faixa não produzem NaN nem alfa negativo.
+        for deriva in [-3.0f32, 0.5, 7.0, f32::NAN] {
+            let t = tinta_da_poca(cor, deriva, 3.0);
+            assert!(t.a.is_finite() && (0.0..=1.0).contains(&t.a), "alfa {}", t.a);
+            assert!((0.0..=1.0).contains(&t.r), "r {}", t.r);
+        }
+    }
+
+    #[test]
+    fn as_pocas_do_mesmo_tom_cabem_numa_chamada() {
+        let azul = Color3D::new(0.2, 0.86, 1.0, 0.5);
+        let verde = Color3D::new(0.55, 1.0, 0.35, 0.5);
+        let m = matriz_de_carro(Rotacao::Nenhuma, PontoCore::ZERO, 0.0, 0.0);
+        let grupos = agrupar_por_tinta(vec![
+            (azul, m),
+            (verde, m),
+            (azul, m),
+            (verde, m),
+            (azul, m),
+        ]);
+
+        assert_eq!(grupos.len(), 2, "duas cores deviam dar dois lotes");
+        assert_eq!(grupos[0].0, azul, "a ordem é a de chegada");
+        assert_eq!(grupos[1].0, verde);
+        assert_eq!(grupos[0].1.len(), 3);
+        assert_eq!(grupos[1].1.len(), 2);
+        assert_eq!(
+            grupos.iter().map(|(_, m)| m.len()).sum::<usize>(),
+            5,
+            "nenhuma poça pode sumir no agrupamento"
+        );
+    }
+
+    #[test]
+    fn o_veu_escurece_o_menu_e_some_na_corrida() {
+        // O alvo é o que o jogador vê: a tela de texto escurecida e a gameplay
+        // limpa. Se `alvo_veu` devolvesse o mesmo número para as duas, o jogo
+        // sairia escuro — ou o texto ficaria ilegível, que é o defeito original.
+        assert_eq!(alvo_veu(Fase::Correndo), 0.0, "a gameplay é a tela cheia");
+        assert!(alvo_veu(Fase::Titulo) > 0.5, "o título precisa de véu forte");
+        assert!(
+            alvo_veu(Fase::Titulo) > alvo_veu(Fase::Resultado),
+            "o título tem mais texto sobre o cenário que o resultado"
+        );
+        for fase in [Fase::Titulo, Fase::Resultado, Fase::Correndo] {
+            let v = alvo_veu(fase);
+            assert!((0.0..=1.0).contains(&v), "{fase:?}: alfa {v}");
+        }
+    }
+
+    #[test]
+    fn o_veu_chega_ao_alvo_em_meio_segundo() {
+        // A transição do título para a corrida tem de terminar antes da
+        // contagem: um véu que ainda escurece quando o carro larga é o defeito
+        // que esta mudança veio corrigir, só que ao contrário.
+        let dt = 1.0 / 75.0;
+        let mut veu = VEU_TITULO;
+        let mut quadros = 0;
+        while veu > 0.002 && quadros < 75 {
+            veu = avancar_veu(veu, 0.0, dt);
+            quadros += 1;
+        }
+        assert!(
+            quadros <= 38,
+            "o véu levou {quadros} quadros (mais de 0,5 s) para sumir"
+        );
+        assert_eq!(veu, 0.0, "o encaixe tem de zerar, não deixar 1e-7");
+    }
+
+    #[test]
+    fn o_veu_sobe_e_desce_sem_pular() {
+        // A troca tem de ser vista, não sentida: um salto de 0,62 para 0,0 num
+        // quadro pisca a tela no "JOGAR", no instante em que o jogador começa a
+        // olhar a pista.
+        let dt = 1.0 / 75.0;
+        let mut veu = VEU_TITULO;
+        let mut anterior = veu;
+        for _ in 0..40 {
+            veu = avancar_veu(veu, 0.0, dt);
+            let passo = anterior - veu;
+            assert!(passo >= 0.0, "o véu voltou a subir na saída");
+            assert!(passo <= 0.2, "salto de {passo:.3} num quadro — isso pisca");
+            anterior = veu;
+        }
+
+        // E a volta (menu depois da corrida) também é gradual.
+        let mut anterior = veu;
+        for _ in 0..40 {
+            veu = avancar_veu(veu, VEU_TITULO, dt);
+            assert!(veu >= anterior - 1e-6, "o véu desceu ao reaparecer");
+            assert!(veu - anterior <= 0.2);
+            anterior = veu;
+        }
+        assert!((veu - VEU_TITULO).abs() < 1e-3);
+    }
+
+    #[test]
+    fn o_veu_nunca_passa_do_alvo_nem_produz_nan() {
+        let dt = 1.0 / 75.0;
+        // `dt` zero (relógio parado) e negativo não movem nem estragam.
+        for dt_ruim in [0.0f32, -0.5, f32::NAN] {
+            assert_eq!(
+                avancar_veu(VEU_TITULO, 0.0, dt_ruim),
+                VEU_TITULO,
+                "dt {dt_ruim} não pode mexer no véu"
+            );
+        }
+        // Entradas corrompidas: um alfa `NaN` faria o driver descartar o quad.
+        for (atual, alvo) in [
+            (f32::NAN, 0.5f32),
+            (0.5, f32::NAN),
+            (-3.0, 2.0),
+            (0.3, -1.0),
+        ] {
+            let v = avancar_veu(atual, alvo, dt);
+            assert!(v.is_finite() && (0.0..=1.0).contains(&v), "{atual}/{alvo} → {v}");
+        }
+        // Convergência monotônica em passos grandes.
+        let mut veu = 0.0;
+        for _ in 0..200 {
+            let novo = avancar_veu(veu, VEU_TITULO, 0.25);
+            assert!(novo >= veu.min(VEU_TITULO) && novo <= VEU_TITULO);
+            veu = novo;
+        }
+        assert_eq!(veu, VEU_TITULO);
     }
 
     #[test]

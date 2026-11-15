@@ -429,6 +429,65 @@ impl Default for Construtor {
 ///
 /// É a peça de tudo o que é "colado na tela": partículas, rastro e o HUD. O
 /// tamanho vem da matriz de modelo, então uma malha serve para todos.
+/// Pirâmide de base quadrada: o cone de obstáculo, sem modelo externo.
+///
+/// Base em `y = 0`, ápice em `y = altura`, centrada na origem. Quatro faces
+/// trianguladas mais a base; normais por face, porque o cone é facetado de
+/// propósito (um cone liso num jogo noturno de baixa poli lê como borrão).
+pub fn cone(raio: f32, altura: f32) -> (Vec<Vertex>, Vec<u32>) {
+    let base = [
+        [-raio, 0.0, -raio],
+        [raio, 0.0, -raio],
+        [raio, 0.0, raio],
+        [-raio, 0.0, raio],
+    ];
+    let apice = [0.0, altura, 0.0];
+    let mut vertices = Vec::with_capacity(18);
+    let mut indices = Vec::with_capacity(18);
+    let normal = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
+        [n[0] / len, n[1] / len, n[2] / len]
+    };
+    for i in 0..4 {
+        let a = base[i];
+        let b = base[(i + 1) % 4];
+        let n = normal(a, b, apice);
+        let inicio = vertices.len() as u32;
+        vertices.push(Vertex::new(a, n, [0.0, 0.0]));
+        vertices.push(Vertex::new(b, n, [1.0, 0.0]));
+        vertices.push(Vertex::new(apice, n, [0.5, 1.0]));
+        indices.extend([inicio, inicio + 1, inicio + 2]);
+    }
+    // Base virada para baixo: sem ela o cone some quando visto de baixo.
+    let n = [0.0, -1.0, 0.0];
+    let inicio = vertices.len() as u32;
+    for p in base {
+        vertices.push(Vertex::new(p, n, [0.0, 0.0]));
+    }
+    indices.extend([inicio, inicio + 2, inicio + 1, inicio, inicio + 3, inicio + 2]);
+    (vertices, indices)
+}
+
+/// Portal de emergência quando o `.obj` não pôde ser lido.
+///
+/// Duas colunas e uma viga: não é o anel bonito, mas mantém o checkpoint
+/// visível e não deixa o jogo sem a referência de volta.
+pub fn portal_fallback() -> (Vec<Vertex>, Vec<u32>) {
+    let mut c = Construtor::new();
+    for x in [-5.05f32, 5.05] {
+        c.caixa([x, 2.5, 0.0], [0.6, 5.0, 0.6]);
+    }
+    c.caixa([0.0, 5.0, 0.0], [11.0, 0.6, 0.6]);
+    (c.vertices().to_vec(), c.indices().to_vec())
+}
+
 pub fn quad() -> (Vec<Vertex>, Vec<u32>) {
     let mut c = Construtor::com_capacidade(4, 6);
     c.quad(

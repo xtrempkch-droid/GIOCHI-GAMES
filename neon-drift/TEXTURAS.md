@@ -32,7 +32,8 @@ GIOCHI_SPRITES=~/minha-folha.png giochi-neon-drift       # folha 4x2 ou 8x1
 O log na abertura diz de onde veio cada coisa:
 
 ```text
-neon-drift: 7 textura(s) [...] 3 de arquivo · 4 procedurais, 64 x 64 de receita
+neon-drift: 9 textura(s) [...] 3 de arquivo · 6 procedurais, 64 x 64 de receita
+neon-drift: máscaras de luz 'halo-neon' e 'cone-farol' (64 x 64, 32768 bytes, só alfa)
 neon-drift: atlas de sprites 128x128 [...] (origem: folha externa (PNG/JPEG/BMP via SDL_image))
 ```
 
@@ -48,7 +49,7 @@ neon-drift: atlas de sprites 128x128 [...] (origem: folha externa (PNG/JPEG/BMP 
 | canais | **RGBA8**, 4 bytes por pixel | 16 384 bytes por textura |
 | escala no mundo | **1 textura = 3,0 m** | `malha::METROS_POR_TILE` |
 | endereçamento | `REPEAT` | o chão tem 2 081 m: a textura repete ~694 vezes |
-| filtro | `LINEAR` | sem mipmap; a 640×480 é o que dá conta |
+| filtro | `LINEAR` + mipmap (`LINEAR_MIPMAP_LINEAR`) | potência de dois é o que o GLES 2.0 exige para gerar mip e usar `REPEAT`; o mip é o que impede o asfalto de tremer ao longe |
 | cor | **cinza-claro e neutro** | a cor final é `amostra × tint` (ver abaixo) |
 | UV | **por posição no mundo** | não 0..1 por quadrilátero |
 
@@ -85,7 +86,7 @@ Os `tint` em uso hoje (`cena3d.rs`):
 | painel de neon | `1.0 0.55 0.92` | `painel` |
 | xadrez da largada | `0.95 0.95 1.0` | `xadrez` |
 
-### As sete texturas e onde cada uma aparece
+### As nove texturas e onde cada uma aparece
 
 | Textura | O que desenha | Regra de desenho |
 | --- | --- | --- |
@@ -96,6 +97,33 @@ Os `tint` em uso hoje (`cena3d.rs`):
 | `guarda_corpo` | chapa do guarda-corpo da serra | nervura vertical a cada 8 px, sombra de um lado e luz do outro — passando depressa é metade da sensação de velocidade |
 | `painel` | outdoor de neon | gradiente diagonal + grade fina; o `tint` é forte, então aqui a textura deve ser **clara** |
 | `xadrez` | faixa de largada | 8×8 quadrados alternados, puro preto e branco |
+| `faixa-pista` | tracejado central e faixas de rampa | **decalque**: fundo quase preto (é o asfalto) e traço branco; o tracejado vem da textura, não de geometria |
+| `grade-neon` | fita de advertência no topo das barreiras | **decalque**: grade ortogonal branca a cada 16 px; ortogonal e não diagonal porque a fita é rasante e a diagonal se perde na perspectiva |
+
+### As duas máscaras de luz (e por que não estão na lista acima)
+
+A poça de neon embaixo de cada carro e o cone do farol no asfalto usam textura,
+mas **não** são materiais: o RGB é branco em toda a imagem e quem desenha é o
+**alfa**. Elas ficam fora de `texturas::todas()` e o `GIOCHI_TEXTURAS` não as
+alcança — um halo pintado à mão perderia a única propriedade que importa (o alfa
+cair do ponto quente até a borda sem degrau), e o sintoma de trocá-las por um
+material é conhecido: a poça vira um retângulo de borda dura.
+
+| Máscara | Fórmula | O que ela desenha |
+| --- | --- | --- |
+| `halo-neon` | `(1 − r)^1,2` | elipse da luz indireta sob o carro; `r` é a distância normalizada ao centro, e como o quad tem a proporção do carro a elipse sai alongada no sentido certo |
+| `cone-farol` | `lateral × alcance` | cone do farol: meia-largura `0,45 + 0,55·v` (estreito no para-choque, aberto na ponta) e queda `(1 − v)^1,15` |
+
+As duas são 64×64 (potência de dois, então mipmap e `REPEAT` automáticos) e
+sobem por `create_texture_from_rgba`, como as outras. O **expoente baixo** é
+proposital: luz de neon não tem bico, ela some devagar; um expoente alto
+desenharia um ponto brilhante no meio do carro e nada em volta, que lê como
+adesivo.
+
+A cor vem do `u_tint` do desenho: a poça usa a cor do carro — e no drift ela
+puxa 40 % para o branco e o alfa sobe de 0,46 para 0,86 —, e o farol usa um
+branco-frio fixo para todos. Ver a seção "A luz que os carros jogam no chão" no
+[README](./README.md#a-luz-que-os-carros-jogam-no-chão).
 
 ### O UV vem do mundo, não do quadrilátero
 
@@ -114,8 +142,8 @@ textura é **contínua por 3 m** e que a escala é sempre a mesma em qualquer ma
 giochi-neon-drift --texturas /tmp/texturas.bmp
 ```
 
-Sai uma tira horizontal 480×72 com as sete texturas de 64×64 na ordem de
-`texturas::todas()`, com 4 px de separação e fundo cinza-escuro. É o molde: pinte
+Sai uma tira horizontal com as **nove** texturas de 64×64 na ordem de
+`texturas::todas()`, 4 px de separação e fundo cinza-escuro (616×72 com as nove). É o molde: pinte
 dentro da célula de 64×64 e a densidade já está certa.
 
 Para olhar uma superfície no jogo, isole a malha:
@@ -137,12 +165,21 @@ via `GIOCHI_SEM`).
 | mudar a cor de um material | `crates/ui-sdl/src/cena3d.rs` | a constante `ASFALTO`, `CONCRETO`… |
 | mudar a escala no mundo | `crates/ui-sdl/src/malha.rs` | `METROS_POR_TILE` — afeta **todas** as texturas |
 | acrescentar uma textura | `texturas.rs` + o `struct TexturasGpu` em `cena3d.rs` | função nova, campo novo, `criar()` e um braço no laço de desenho |
+| mudar o halo da poça ou o cone do farol | `crates/ui-sdl/src/texturas.rs` | `halo_neon()` e `cone_farol()` — são máscaras de **alfa**, e o RGB tem de ficar branco |
+| mudar o tamanho ou o brilho da luz do carro | `crates/ui-sdl/src/cena3d.rs` | `POCA_*`, `FEIXE_*`, `tinta_da_poca` e `rampa_de_drift` |
 | trocar a geometria que a usa | `crates/ui-sdl/src/malha.rs` | `chao3`, `caixa_texturizada`, `parede3` |
 
-**Orçamento:** textura não custa chamada de desenho — custa área de tela. As sete
-somadas ocupam 114 688 bytes na GPU e nenhum draw call extra. O que pesa é
-**quantos pixels do quadro** cada superfície cobre: o asfalto é o quadro inteiro
-embaixo do carro, e por isso ele é o material com maior orçamento de detalhe.
+**Orçamento:** textura não custa chamada de desenho — custa área de tela. As nove
+somadas ocupam 147 456 bytes na GPU (as duas máscaras entram com 32 768) e
+nenhum draw call extra **por material**. O que pesa é **quantos pixels do
+quadro** cada superfície cobre: o asfalto é o quadro inteiro embaixo do carro, e
+por isso ele é o material com maior orçamento de detalhe.
+
+As máscaras são a exceção à regra "textura não custa desenho", e é bom saber
+por quê: o `u_tint` do desenho instanciado vale para o lote inteiro, então a
+poça de cada carro custa uma chamada (uma por cor). `agrupar_por_tinta` funde as
+cores repetidas, e no LAN isso acontece de verdade — a paleta tem quatro cores
+para até oito carros.
 
 ---
 
@@ -301,12 +338,9 @@ enquanto o jogo desenha a folha do usuário mede outra coisa.
 
 Não é falta de aviso: está declarado aqui para ninguém procurar o recurso.
 
-- **Não há carregamento de textura de superfície externa.** As sete são geradas
-  em código; um PNG/BMP em `assets/` não é lido. Quem quiser trocar o asfalto
-  edita `texturas::asfalto()`.
-- **Não há mipmap.** Textura a 64×64 num chão que recua ao horizonte produz
-  *aliasing* longe da câmera. Resolver exige `GL_LINEAR_MIPMAP_LINEAR` e geração
-  de mip, que a engine não expõe hoje.
+- **As máscaras de luz não aceitam arquivo.** `GIOCHI_TEXTURAS` troca as nove
+  superfícies, mas o halo da poça e o cone do farol são recusados de propósito:
+  elas são gradientes de alfa, não desenhos. Ver a seção das máscaras acima.
 - **Não há folha de sprite com mais de 8 formas.** `Forma::TODAS` tem 8 e o atlas
   é 4×4; uma folha com 16 formas entraria nas células certas, mas o jogo só sabe
   pedir as 8.
@@ -314,14 +348,21 @@ Não é falta de aviso: está declarado aqui para ninguém procurar o recurso.
   geometria (UV embutido no quadrilátero), não uniforme — animar exigiria trocar
   o UV por quadro.
 
+> Dois itens que estavam nesta lista **deixaram de ser verdade** na modernização
+> para a engine 0.4.0, e ficam registrados para quem leu a versão antiga: textura
+> de superfície **pode** vir de arquivo (`GIOCHI_TEXTURAS`, acima) e **há
+> mipmap** — todas as superfícies são potência de dois, que é o que o GLES 2.0
+> exige para `LINEAR_MIPMAP_LINEAR` e `REPEAT`; o atlas de sprites é a exceção
+> deliberada, sem mipmap, para uma célula não puxar o texel da vizinha.
+
 ---
 
 ## Resumo de uma linha por arquivo
 
 ```text
-texturas.rs   64x64 RGBA, cinza-claro, cor vem do tint — 7 materiais
+texturas.rs   64x64 RGBA: 9 materiais (cor vem do tint) + 2 máscaras de alfa
 atlas.rs      128x128, grade 4x4 de 32px, RGB branco, alfa desenha — 8 formas
 malha.rs      METROS_POR_TILE = 3.0; chao3/caixa_texturizada/parede3 fazem o UV
-cena3d.rs     os tints (ASFALTO, CONCRETO, ...) e qual malha usa qual textura
+cena3d.rs     os tints (ASFALTO, CONCRETO, ...), os decalques de luz e qual malha usa qual textura
 particulas.rs qual forma cada tipo de partícula usa, e cor/gravidade/arrasto
 ```

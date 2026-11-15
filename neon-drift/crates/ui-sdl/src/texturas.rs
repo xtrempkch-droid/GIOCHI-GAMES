@@ -1,4 +1,5 @@
-//! Texturas procedurais: asfalto, concreto, rocha, mata, guarda-corpo e neon.
+//! Texturas procedurais: asfalto, concreto, rocha, mata, guarda-corpo, neon e as
+//! duas **máscaras de luz** (halo da poça de neon e cone do farol).
 //!
 //! ## Por que gerar em vez de carregar PNG
 //!
@@ -301,6 +302,146 @@ pub fn xadrez() -> Textura {
     }
 }
 
+/// Faixa de pista: duas linhas longitudinais com tracejado.
+///
+/// Substitui a faixa central que era cor chapada (`m.faixas`). A textura dá o
+/// tracejado **sem geometria**: um quad de 12 m mostra oito traços por repetição
+/// em vez de oito quads, e o `u_tint` do desenho continua mandando na cor.
+///
+/// Fundo escuro e traço claro: o material é multiplicado pelo tint, então o que
+/// é preto fica preto e o que é branco recebe a cor do pulso.
+pub fn faixa_pista() -> Textura {
+    let lado = LADO;
+    let mut pixels = Vec::with_capacity((lado * lado * 4) as usize);
+    for y in 0..lado {
+        for x in 0..lado {
+            // Duas linhas em X (a faixa do meio, vista de cima) e tracejado em
+            // Y de 8 em 8. A textura é aplicada com UV de mundo, então o
+            // "8 de 8" vira 8 m de traço e 8 m de vazio com `tile` de 12 m.
+            let na_linha = (2..6).contains(&(x % 16)) || (10..14).contains(&(x % 16));
+            let no_traco = (y % 8) < 5;
+            if na_linha && no_traco {
+                pixels.extend_from_slice(&px(1.0, 1.0, 1.0, 1.0));
+            } else {
+                pixels.extend_from_slice(&px(0.06, 0.06, 0.08, 1.0));
+            }
+        }
+    }
+    Textura {
+        nome: "faixa-pista",
+        largura: lado,
+        altura: lado,
+        pixels,
+    }
+}
+
+/// Grade de neon: linhas finas cruzadas sobre fundo escuro.
+///
+/// É a textura das fitas de advertência das barreiras. Grade e não traço
+/// diagonal (que é o `painel-neon`) porque a leitura na pista é outra: o painel
+/// é um **outdoor** visto de frente, a grade é uma fita **rasante** ao chão, e a
+/// malha ortogonal sobrevive à compressão de perspectiva que a diagonal perde.
+pub fn grade_neon() -> Textura {
+    let lado = LADO;
+    let mut pixels = Vec::with_capacity((lado * lado * 4) as usize);
+    for y in 0..lado {
+        for x in 0..lado {
+            let linha = x % 16 < 2 || y % 16 < 2;
+            if linha {
+                pixels.extend_from_slice(&px(1.0, 1.0, 1.0, 1.0));
+            } else {
+                pixels.extend_from_slice(&px(0.05, 0.05, 0.07, 1.0));
+            }
+        }
+    }
+    Textura {
+        nome: "grade-neon",
+        largura: lado,
+        altura: lado,
+        pixels,
+    }
+}
+
+// ───────────────────────────── máscaras de luz ──────────────────────────────
+//
+// As duas texturas abaixo **não são materiais**: o RGB é branco em toda a
+// imagem e o que desenha é o **alfa**, que cai do ponto quente até zero. Elas
+// ficam fora de [`todas`] de propósito, pela mesma razão que o atlas de sprites
+// fica: `todas()` é a lista que o `GIOCHI_TEXTURAS` troca por um arquivo
+// pintado, e um halo pintado à mão perderia a única propriedade que importa
+// (o alfa cair sem degrau). O sintoma de trocá-las por material é conhecido e
+// está documentado no `cena3d.rs`: a poça de luz vira um retângulo de borda
+// dura — foi o que havia antes destas máscaras.
+
+/// Centro do texel em coordenadas `0.0..1.0`.
+///
+/// **Centro**, não canto: amostrar no canto faz a última coluna valer 1,0 e o
+/// `LINEAR` da borda interpolar com um texel que não existe.
+fn centro_do_texel(x: u32, y: u32, lado: u32) -> (f32, f32) {
+    (
+        (x as f32 + 0.5) / lado as f32,
+        (y as f32 + 0.5) / lado as f32,
+    )
+}
+
+/// Máscara branca com o alfa dado por uma função da posição do texel.
+fn mascara(nome: &'static str, alfa: impl Fn(f32, f32) -> f32) -> Textura {
+    let lado = LADO;
+    let mut pixels = Vec::with_capacity((lado * lado * 4) as usize);
+    for y in 0..lado {
+        for x in 0..lado {
+            let (u, v) = centro_do_texel(x, y, lado);
+            pixels.extend_from_slice(&px(1.0, 1.0, 1.0, alfa(u, v)));
+        }
+    }
+    Textura {
+        nome,
+        largura: lado,
+        altura: lado,
+        pixels,
+    }
+}
+
+/// Halo elíptico da luz indireta que o neon do carro joga no asfalto.
+///
+/// O alfa é `(1 - r)^1.2`, com `r` a distância normalizada ao centro: cheio
+/// embaixo do carro e zero na borda do quad. Como o quad da poça tem a
+/// proporção do carro (2,5 × 4,2 m), o círculo em UV vira a elipse em metros,
+/// que é a forma certa — alongada no sentido do carro.
+///
+/// O expoente é **baixo de propósito** (1,2 e não 3): a luz de um neon não tem
+/// bico, ela some devagar. Um expoente alto desenharia um ponto brilhante no
+/// meio do carro e nada em volta, que lê como adesivo, não como luz.
+pub fn halo_neon() -> Textura {
+    mascara("halo-neon", |u, v| {
+        let dx = (u - 0.5) * 2.0;
+        let dy = (v - 0.5) * 2.0;
+        let r = (dx * dx + dy * dy).sqrt();
+        (1.0 - r).max(0.0).powf(1.2)
+    })
+}
+
+/// Cone do farol projetado no asfalto.
+///
+/// `v` corre do para-choque (`0`) para a ponta do feixe (`1`); `u`, de lado a
+/// lado. O alfa é o produto de duas quedas:
+///
+/// - **lateral**: o feixe é estreito junto do carro e abre com a distância, o
+///   que dá o triângulo do cone dentro de um quad retangular;
+/// - **de alcance**: a luz morre com a distância, então a ponta apaga.
+///
+/// Sem a primeira, o feixe seria uma faixa de largura constante — que é
+/// exatamente o que havia antes e o que lia como "um retângulo azul no chão".
+pub fn cone_farol() -> Textura {
+    mascara("cone-farol", |u, v| {
+        // Meia-largura do cone, em fração da meia-largura do quad.
+        let meia_largura = 0.45 + 0.55 * v;
+        let lateral = ((1.0 - ((u - 0.5).abs() * 2.0) / meia_largura).max(0.0)).powf(1.3);
+        let alcance = (1.0 - v).powf(1.15);
+        lateral * alcance
+    })
+}
+
 /// Todas as texturas do jogo, na ordem em que são criadas.
 pub fn todas() -> Vec<Textura> {
     vec![
@@ -311,6 +452,8 @@ pub fn todas() -> Vec<Textura> {
         guarda_corpo(),
         painel_neon(),
         xadrez(),
+        faixa_pista(),
+        grade_neon(),
     ]
 }
 
@@ -362,6 +505,16 @@ mod testes {
         }
     }
 
+    /// Texturas cujo papel é **padrão**, não superfície.
+    ///
+    /// `faixa-pista` e `grade-neon` são decalques: o fundo escuro é o asfalto e o
+    /// que desenha são as linhas. Medir a média delas reprovaria uma textura
+    /// correta — o que importa é que a **linha** chegue clara e cubra área
+    /// suficiente para ser vista de longe.
+    fn eh_decalque(nome: &str) -> bool {
+        matches!(nome, "faixa-pista" | "grade-neon")
+    }
+
     #[test]
     fn as_texturas_sao_claras_o_suficiente_para_o_tint_mandar() {
         // O material do jogo já é escuro (noite), e a cor final é
@@ -371,12 +524,23 @@ mod testes {
             // O **maior canal** de cada pixel, e não o vermelho: a mata é verde
             // de propósito, e medir o R dela reprovaria uma textura correta. O
             // que precisa ser claro é a luminância que o `tint` vai multiplicar.
-            let soma: u64 = t
+            let luminancia: Vec<u8> = t
                 .pixels
                 .chunks(4)
-                .map(|p| p[0].max(p[1]).max(p[2]) as u64)
-                .sum();
-            let media = soma / (LADO * LADO) as u64;
+                .map(|p| p[0].max(p[1]).max(p[2]))
+                .collect();
+            if eh_decalque(t.nome) {
+                let claros = luminancia.iter().filter(|v| **v > 200).count();
+                let fracao = claros as f32 / luminancia.len() as f32;
+                assert!(
+                    fracao > 0.05,
+                    "{}: só {:.1}% de pixels claros — o padrão não vai aparecer",
+                    t.nome,
+                    fracao * 100.0
+                );
+                continue;
+            }
+            let media = luminancia.iter().map(|v| u64::from(*v)).sum::<u64>() / (LADO * LADO) as u64;
             assert!(
                 media > 90,
                 "{}: média de {media} de 255 — escura demais para receber tint",
@@ -409,6 +573,82 @@ mod testes {
         assert!(em(0, 8) < 60, "a casa de baixo devia ser escura");
         assert!(em(8, 8) > 200, "a diagonal devia voltar a ser clara");
     }
+
+    /// Alfa de um texel da máscara.
+    fn alfa(t: &Textura, x: u32, y: u32) -> u8 {
+        t.pixels[((y * LADO + x) * 4 + 3) as usize]
+    }
+
+    #[test]
+    fn as_mascaras_de_luz_sao_brancas_e_so_o_alfa_varia() {
+        // A cor final é `amostra × tint`. Se o RGB da máscara não fosse branco,
+        // o neon de cada carro sairia com a cor do carro **vezes** a cor da
+        // máscara, e as quatro cores da paleta deixariam de ser as quatro que o
+        // jogador aprendeu a distinguir.
+        for t in [halo_neon(), cone_farol()] {
+            assert!(t.largura.is_power_of_two() && t.altura.is_power_of_two(), "{}", t.nome);
+            assert!(
+                t.pixels.chunks(4).all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255),
+                "{}: o RGB tem de ser branco em toda a máscara",
+                t.nome
+            );
+            let com_alfa = t.pixels.chunks(4).filter(|p| p[3] < 250).count();
+            assert!(
+                com_alfa > LADO as usize * LADO as usize / 2,
+                "{}: só {com_alfa} texels com alfa — não é um gradiente",
+                t.nome
+            );
+        }
+    }
+
+    #[test]
+    fn o_halo_apaga_do_centro_para_a_borda() {
+        let t = halo_neon();
+        let centro = alfa(&t, LADO / 2, LADO / 2);
+        assert!(centro > 200, "o centro da poça devia ser quase opaco: {centro}");
+        for (x, y) in [(0, 0), (LADO - 1, 0), (0, LADO - 1), (LADO - 1, LADO - 1)] {
+            assert_eq!(alfa(&t, x, y), 0, "o canto ({x},{y}) devia estar apagado");
+        }
+        // Monotônico ao longo do raio horizontal: um halo que voltasse a
+        // acender na borda desenharia um anel, não uma poça.
+        let mut anterior = 255;
+        for x in (LADO / 2)..LADO {
+            let atual = alfa(&t, x, LADO / 2);
+            assert!(atual <= anterior, "alfa subiu de {anterior} para {atual} em x={x}");
+            anterior = atual;
+        }
+    }
+
+    #[test]
+    fn o_cone_do_farol_estreita_no_carro_e_apaga_na_ponta() {
+        let t = cone_farol();
+
+        // A largura iluminada cresce com a distância: é o que faz um quad
+        // retangular ler como cone.
+        let largura_em = |v: u32| {
+            (0..LADO).filter(|x| alfa(&t, *x, v) > 40).count()
+        };
+        let junto = largura_em(2);
+        let longe = largura_em(LADO / 2);
+        assert!(
+            longe > junto,
+            "o feixe devia abrir: {junto} texels junto ao carro contra {longe} no meio"
+        );
+
+        // A ponta apaga e o para-choque acende.
+        assert_eq!(largura_em(LADO - 1), 0, "a ponta do feixe devia apagar");
+        assert!(
+            alfa(&t, LADO / 2, 1) > 200,
+            "junto ao para-choque o feixe devia estar cheio"
+        );
+
+        // A borda lateral do quad fica apagada em qualquer distância: sem isso
+        // o cone teria a largura do quad e voltaria a ser uma faixa.
+        for v in [0, LADO / 4, LADO / 2] {
+            assert_eq!(alfa(&t, 0, v), 0, "a borda esquerda em v={v} devia apagar");
+            assert_eq!(alfa(&t, LADO - 1, v), 0, "a borda direita em v={v} devia apagar");
+        }
+    }
 }
 
 // ───────────────────────────── textura vinda de arquivo ─────────────────────
@@ -423,7 +663,7 @@ pub const EXTENSOES: [&str; 4] = ["png", "bmp", "jpg", "jpeg"];
 
 /// Variável de ambiente com o diretório das texturas de superfície.
 ///
-/// Vazia ou ausente = as sete procedurais, que é o comportamento de sempre.
+/// Vazia ou ausente = as nove procedurais, que é o comportamento de sempre.
 pub const VARIAVEL: &str = "GIOCHI_TEXTURAS";
 
 /// O diretório pedido por `GIOCHI_TEXTURAS`, se houver um.

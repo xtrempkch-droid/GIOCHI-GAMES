@@ -1,9 +1,13 @@
 # Recorte da GIOCHI-ENGINE-3D, versão 0.4.0 (commit `88741aa`, release "rede,
 # texturas e geometria própria em 3D").
 #
-# `members` reduzido aos dois crates que o jogo usa: `capi`, `lua` e `net` ficam
-# de fora porque o neon-drift não os linka — e um crate que não é usado não pode
+# `members` reduzido aos três crates que o jogo usa: `capi` e `lua` ficam de
+# fora porque o neon-drift não os linka — e um crate que não é usado não pode
 # quebrar o build.
+#
+# `giochi-net` entra desde a modernização de rede (LAN host-autoritativa). O
+# transporte próprio continua sem dependências; `laminar` e `mdns-sd` só são
+# compilados quando o jogo pede as features homónimas.
 #
 # As versões de `glam`/`glow` **seguem o código da engine**, não o contrário: em
 # glam 0.34 as projeções saíram de `Mat4` para `camera::rh::proj::opengl`, e o
@@ -11,7 +15,7 @@
 # 0.2.2) produz um erro de método inexistente que não fala de versão.
 [workspace]
 resolver = "2"
-members = ["giochi-engine", "giochi-engine-3d"]
+members = ["giochi-engine", "giochi-engine-3d", "giochi-net"]
 
 [workspace.package]
 version = "0.4.0"

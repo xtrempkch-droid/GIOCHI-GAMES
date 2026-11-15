@@ -729,7 +729,7 @@ impl Particulas {
                 self.entre(-1.0, 1.0),
             ));
             let giro = self.entre(-14.0, 14.0);
-            let angulo = self.entre(0.0, 6.28);
+            let angulo = self.entre(0.0, std::f32::consts::TAU);
             let tamanho = self.entre(0.06, 0.19);
             self.fragmentos.push(Fragmento {
                 pos: somar(pos, desvio),

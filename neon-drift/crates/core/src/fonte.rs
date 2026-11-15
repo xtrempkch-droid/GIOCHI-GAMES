@@ -92,10 +92,49 @@ pub fn glifo(c: char) -> Option<Glifo> {
         '(' => g([0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010]),
         ')' => g([0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000]),
         'x' => g([0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001]),
+        // Os dois sinais de "seta" existem para o menu do título: o cursor
+        // precisa apontar para a linha e o valor precisa dizer que anda para
+        // os lados, e um `-` no lugar do `<` lia como traço, não como controle.
+        '<' => g([0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010]),
+        '>' => g([0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000]),
+        '[' => g([0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110]),
+        ']' => g([0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110]),
         ' ' => g([0; 7]),
         '—' => g([0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000]),
         _ => return None,
     })
+}
+
+/// Deixa `texto` no alfabeto que a fonte tem: **caixa alta, sem acento**.
+///
+/// A tabela de glifos é maiúscula e ASCII. Um caractere fora dela não é erro —
+/// [`pontos`] avança o cursor e segue —, mas o resultado é um **buraco** no meio
+/// da palavra: "RITMO DE FBRICA". O `pontos` está certo para um HUD que falha
+/// por um acento em vez de sumir inteiro; quem evita o buraco é esta função.
+///
+/// A conversão é **um caractere por um**, de propósito: quem mediu a largura com
+/// [`largura_texto`] antes de chamar continua com a medida certa. Se um dia ela
+/// deixar de ser 1:1, os textos do HUD saem descentralizados em silêncio.
+pub fn para_ascii(texto: &str) -> String {
+    texto
+        .chars()
+        .map(|c| match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'Á' | 'À' | 'Â' | 'Ã' | 'Ä' => 'A',
+            'é' | 'è' | 'ê' | 'ë' | 'É' | 'È' | 'Ê' | 'Ë' => 'E',
+            'í' | 'ì' | 'î' | 'ï' | 'Í' | 'Ì' | 'Î' | 'Ï' => 'I',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' | 'Ó' | 'Ò' | 'Ô' | 'Õ' | 'Ö' => 'O',
+            'ú' | 'ù' | 'û' | 'ü' | 'Ú' | 'Ù' | 'Û' | 'Ü' => 'U',
+            'ç' | 'Ç' => 'C',
+            'ñ' | 'Ñ' => 'N',
+            // Sem glifo para a cedilha solta, para o ordinal nem para o travessão
+            // curto: viram o sinal que a fonte tem e que mais se aproxima.
+            'º' | 'ª' => 'O',
+            '–' | '—' | '―' => '-',
+            '“' | '”' | '„' => '"',
+            '‘' | '’' => '\'',
+            outro => outro.to_ascii_uppercase(),
+        })
+        .collect()
 }
 
 /// Largura, em pontos, de um texto de uma linha.
@@ -215,10 +254,42 @@ mod testes {
             "ESPACO FRENAGEM",
             "SHIFT NITRO",
             "ENTER PARA COMECAR",
+            // O menu do título (ver `menu.rs`): o cursor e as setas de valor
+            // são os quatro glifos abaixo, e a legenda inteira precisa caber.
+            "> MAPA < AVENIDA CENTRAL >",
+            "DIFICULDADE < DESAFIANTE >",
+            "QUALIDADE < 0.75 >",
+            "PERFIL < LIGADO >",
+            "LAN < HOSPEDAR >",
+            "A OU START  JOGAR",
+            "START JOGAR   Y VOLTAR",
+            "ANALOGICO/DIRECIONAL VIRAR   A OU GATILHO ACELERAR",
+            "ESQ/DIR TROCA O MAPA",
         ];
         for texto in textos {
             let faltando: Vec<char> = texto.chars().filter(|c| glifo(*c).is_none()).collect();
             assert!(faltando.is_empty(), "faltam glifos em {texto:?}: {faltando:?}");
+        }
+    }
+
+    #[test]
+    fn o_acento_vira_a_letra_e_nao_um_buraco() {
+        // O sintoma era "RITMO DE FBRICA": o acento não tem glifo, o cursor
+        // avançava e a letra sumia. Ninguém vê um `?` vermelho; vê uma palavra
+        // com falta de letra e conclui que o jogo está quebrado.
+        assert_eq!(para_ascii("Ritmo de fábrica"), "RITMO DE FABRICA");
+        assert_eq!(para_ascii("AÇÃO"), "ACAO");
+        assert_eq!(para_ascii("coração"), "CORACAO");
+        assert_eq!(para_ascii("–"), "-");
+        for texto in ["Ritmo de fábrica", "AÇÃO", "coração", "ÀÉÎÕÜÇ"] {
+            let limpo = para_ascii(texto);
+            assert_eq!(
+                limpo.chars().count(),
+                texto.chars().count(),
+                "a conversão mudou o número de caracteres em {texto:?}"
+            );
+            let faltando: Vec<char> = limpo.chars().filter(|c| glifo(*c).is_none()).collect();
+            assert!(faltando.is_empty(), "{texto:?} → {limpo:?} ainda tem {faltando:?}");
         }
     }
 

@@ -39,33 +39,102 @@ pub struct Teclas {
 }
 
 /// Ações de tela que o laço precisa executar.
+///
+/// São **níveis**, não bordas: "a seta está apertada". Quem transforma nível em
+/// borda é [`bordas`], porque segurar a seta não pode trocar de mapa 75 vezes
+/// por segundo — e essa é a única regra que o laço precisa repetir a cada
+/// quadro.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Acoes {
-    /// Começar a corrida (tela de título).
-    pub comecar: bool,
-    /// Pedido de troca de mapa, `-1` ou `+1`; `0` é "nada".
+    /// Cursor do menu: `-1` sobe, `+1` desce, `0` fica.
     ///
-    /// Só tem efeito na tela de título. Ali o carro não anda, então a seta
-    /// esquerda/direita está livre — e é onde o jogador procura o mapa, não na
-    /// linha de comando de um aparelho sem teclado.
-    pub trocar_mapa: i32,
-    /// Pedido de troca de dificuldade, `-1` ou `+1`; `0` é "nada".
-    ///
-    /// Só no título, e nas **verticais**: as horizontais já são o mapa, e no
-    /// aparelho não há tecla para mais nada.
-    pub trocar_dificuldade: i32,
-    /// Reiniciar (tela de resultado).
-    pub reiniciar: bool,
-    /// Sair do jogo.
-    pub sair: bool,
+    /// Só no título, onde o carro está parado — a mesma seta que vira o volante
+    /// na corrida escolhe a linha no menu.
+    pub navegar: i32,
+    /// Valor da linha atual: `-1`/`+1`.
+    pub ajustar: i32,
+    /// Apertou A: aceita a linha do menu (e no título o carro não acelera, então
+    /// o mesmo botão pode aceitar sem ambiguidade).
+    pub aceitar: bool,
+    /// Apertou START ou Enter: jogar/reiniciar sem passar pelo cursor.
+    pub iniciar: bool,
+    /// Apertou Y/SELECT/Esc: do título sai do jogo; da corrida volta ao menu.
+    pub voltar: bool,
+    /// Apertou X/F1: liga ou desliga o overlay de desempenho.
+    pub perfil: bool,
+}
+
+/// O que **começou** neste quadro.
+///
+/// A borda não é detalhe de gosto: `navegar` é um nível que fica em `-1`
+/// enquanto a seta está apertada, e o laço roda a 75 Hz. Sem esta função, uma
+/// seta segurada trocava de mapa 75 vezes por segundo — foi medido, e o teste
+/// com `--teclas right` mostrou quatro trocas em quatro quadros.
+pub fn bordas(anterior: Acoes, atual: Acoes) -> Acoes {
+    Acoes {
+        // Passo que **mudou**: manter a seta apertada dá sempre o mesmo nível.
+        navegar: if atual.navegar != anterior.navegar {
+            atual.navegar
+        } else {
+            0
+        },
+        ajustar: if atual.ajustar != anterior.ajustar {
+            atual.ajustar
+        } else {
+            0
+        },
+        // Booleano: só a transição de solto para apertado conta.
+        aceitar: atual.aceitar && !anterior.aceitar,
+        iniciar: atual.iniciar && !anterior.iniciar,
+        voltar: atual.voltar && !anterior.voltar,
+        perfil: atual.perfil && !anterior.perfil,
+    }
+}
+
+/// Eixos analógicos de um gamepad, já normalizados e com zona morta.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Analogico {
+    /// Volante, `-1` (esquerda) a `1` (direita).
+    pub virar: f32,
+    /// Gatilho direito, `0..1`.
+    pub acelerar: f32,
+    /// Gatilho esquerdo, `0..1`.
+    pub frear: f32,
 }
 
 /// Combina as duas fontes de entrada com a fase atual.
 pub fn combinar(bits: u32, teclas: &Teclas, fase: Fase) -> (Entrada, Acoes) {
+    combinar_com_analogico(bits, Analogico::default(), teclas, fase)
+}
+
+/// Combina teclado, botões e eixos analógicos.
+///
+/// Os eixos **somam** ao que os botões pedem, mas cada canal é limitado a 1:
+/// apertar acelerar no gatilho e na seta ao mesmo tempo não dá o dobro de
+/// aceleração. A assinatura separada de [`combinar`] mantém a função pura e
+/// testável — o `evdev` e o gamepad entram por máscara, o analógico por valor.
+pub fn combinar_com_analogico(
+    bits: u32,
+    analogico: Analogico,
+    teclas: &Teclas,
+    fase: Fase,
+) -> (Entrada, Acoes) {
     // Teclado e controle **somam** com `max`, não com `or` booleano: se as duas
     // fontes dizem "acelerar", o carro não acelera duas vezes.
-    let mut acelerar: f32 = if bits & evdev::ACELERAR != 0 { 1.0 } else { 0.0 };
-    let mut frear: f32 = if bits & evdev::FREAR != 0 { 1.0 } else { 0.0 };
+    //
+    // O direcional acelera e freia pelo mesmo caminho do botão (`CIMA`/`BAIXO`),
+    // e não acendendo `ACELERAR`: quem joga deitado usa o direcional, e o bit
+    // do A precisa continuar significando só o A (ver `evdev.rs`).
+    let mut acelerar: f32 = if bits & (evdev::ACELERAR | evdev::CIMA) != 0 {
+        1.0
+    } else {
+        0.0
+    };
+    let mut frear: f32 = if bits & (evdev::FREAR | evdev::BAIXO) != 0 {
+        1.0
+    } else {
+        0.0
+    };
     let mut virar: f32 = 0.0;
 
     if bits & evdev::ESQUERDA != 0 {
@@ -74,6 +143,11 @@ pub fn combinar(bits: u32, teclas: &Teclas, fase: Fase) -> (Entrada, Acoes) {
     if bits & evdev::DIREITA != 0 {
         virar += 1.0;
     }
+
+    // Gatilhos e analógico entram depois dos bits, com `max`/soma limitada.
+    acelerar = acelerar.max(analogico.acelerar.clamp(0.0, 1.0));
+    frear = frear.max(analogico.frear.clamp(0.0, 1.0));
+    virar += analogico.virar.clamp(-1.0, 1.0);
 
     if teclas.cima {
         acelerar = acelerar.max(1.0);
@@ -99,44 +173,41 @@ pub fn combinar(bits: u32, teclas: &Teclas, fase: Fase) -> (Entrada, Acoes) {
         nitro,
     };
 
-    let confirmar = bits & evdev::CONFIRMAR != 0 || teclas.enter;
-    let sair = bits & evdev::SAIR != 0 || teclas.escape;
-
-    // No título as setas escolhem o mapa. Em qualquer outra fase elas voltam a
-    // ser volante, e `trocar_mapa` fica 0 — uma tecla com dois significados
-    // simultâneos seria pior que tecla morta.
-    let trocar_mapa = if fase == Fase::Titulo {
-        let mut passo = 0;
+    // ── menu ────────────────────────────────────────────────────────────
+    //
+    // Navegar e ajustar só existem no título. Em qualquer outra fase as setas
+    // voltam a ser volante e os dois ficam em 0 — uma tecla com dois
+    // significados simultâneos seria pior que tecla morta.
+    let (navegar, ajustar) = if fase == Fase::Titulo {
+        let mut navegar = 0;
+        if bits & evdev::CIMA != 0 || teclas.cima {
+            navegar -= 1;
+        }
+        if bits & evdev::BAIXO != 0 || teclas.baixo {
+            navegar += 1;
+        }
+        let mut ajustar = 0;
         if bits & evdev::ESQUERDA != 0 || teclas.esquerda {
-            passo -= 1;
+            ajustar -= 1;
         }
         if bits & evdev::DIREITA != 0 || teclas.direita {
-            passo += 1;
+            ajustar += 1;
         }
-        passo
+        (navegar, ajustar)
     } else {
-        0
-    };
-
-    let trocar_dificuldade = if fase == Fase::Titulo {
-        let mut passo = 0;
-        if teclas.cima || bits & evdev::ACELERAR != 0 {
-            passo -= 1;
-        }
-        if teclas.baixo || bits & evdev::FREAR != 0 {
-            passo += 1;
-        }
-        passo
-    } else {
-        0
+        (0, 0)
     };
 
     let acoes = Acoes {
-        comecar: confirmar && fase == Fase::Titulo,
-        trocar_mapa,
-        trocar_dificuldade,
-        reiniciar: confirmar && fase == Fase::Resultado,
-        sair,
+        navegar,
+        ajustar,
+        // O A aceita em qualquer tela; quem decide se aquilo significa alguma
+        // coisa é a fase, no laço. Assim o mesmo botão não muda de bit conforme
+        // a tela e a fusão continua sem estado.
+        aceitar: bits & evdev::ACEITAR != 0,
+        iniciar: bits & evdev::INICIAR != 0 || teclas.enter,
+        voltar: bits & evdev::VOLTAR != 0 || teclas.escape,
+        perfil: bits & evdev::PERFIL != 0,
     };
 
     (entrada, acoes)
@@ -154,8 +225,8 @@ mod testes {
     fn sem_nada_apertado_o_carro_fica_parado() {
         let (e, a) = combinar(0, &sem_teclas(), Fase::Correndo);
         assert_eq!(e, Entrada::PARADA);
-        assert!(!a.comecar && !a.reiniciar && !a.sair);
-        assert_eq!(a.trocar_mapa, 0);
+        assert!(!a.aceitar && !a.iniciar && !a.voltar && !a.perfil);
+        assert_eq!((a.navegar, a.ajustar), (0, 0));
     }
 
     #[test]
@@ -163,6 +234,30 @@ mod testes {
         let (e, _) = combinar(evdev::ACELERAR | evdev::DIREITA, &sem_teclas(), Fase::Correndo);
         assert_eq!(e.acelerar, 1.0);
         assert_eq!(e.virar, 1.0);
+    }
+
+    #[test]
+    fn o_direcional_tambem_acelera_e_freia() {
+        // Quem joga deitado usa o direcional. O bit é `CIMA`/`BAIXO` (botão
+        // físico) e não `ACELERAR`/`FREAR`, mas o carro tem de andar igual.
+        let (sobe, _) = combinar(evdev::CIMA, &sem_teclas(), Fase::Correndo);
+        assert_eq!(sobe.acelerar, 1.0);
+        let (desce, _) = combinar(evdev::BAIXO, &sem_teclas(), Fase::Correndo);
+        assert_eq!(desce.frear, 1.0);
+        assert_eq!(desce.acelerar, 0.0, "o direcional para baixo não acelera");
+    }
+
+    #[test]
+    fn segurar_o_direcional_nao_apaga_o_acelerar_do_a() {
+        // O bit do A e o do direcional são diferentes justamente para isto: o
+        // jogador acelera com o A, toca o direcional e o carro **não** pode
+        // parar de acelerar quando ele solta o direcional.
+        let com_os_dois = evdev::ACELERAR | evdev::CIMA;
+        let (e, _) = combinar(com_os_dois, &sem_teclas(), Fase::Correndo);
+        assert_eq!(e.acelerar, 1.0);
+        // Soltar o direcional deixa só o A na máscara.
+        let (e, _) = combinar(evdev::ACELERAR, &sem_teclas(), Fase::Correndo);
+        assert_eq!(e.acelerar, 1.0, "o A continua apertado");
     }
 
     #[test]
@@ -207,51 +302,124 @@ mod testes {
     }
 
     #[test]
-    fn enter_no_titulo_comeca_a_corrida() {
+    fn start_no_titulo_comeca_a_corrida() {
+        let (_, a) = combinar(evdev::INICIAR, &sem_teclas(), Fase::Titulo);
+        assert!(a.iniciar, "START no título tem de começar");
         let teclas = Teclas {
             enter: true,
             ..sem_teclas()
         };
         let (_, a) = combinar(0, &teclas, Fase::Titulo);
-        assert!(a.comecar, "enter no título tem de começar");
-        assert!(!a.reiniciar);
+        assert!(a.iniciar, "enter no título tem de começar");
     }
 
     #[test]
-    fn enter_no_resultado_reinicia() {
-        let teclas = Teclas {
-            enter: true,
-            ..sem_teclas()
-        };
-        let (_, a) = combinar(0, &teclas, Fase::Resultado);
-        assert!(a.reiniciar);
-        assert!(!a.comecar);
+    fn start_no_resultado_reinicia() {
+        for (bits, teclas) in [
+            (evdev::INICIAR, sem_teclas()),
+            (
+                0,
+                Teclas {
+                    enter: true,
+                    ..sem_teclas()
+                },
+            ),
+        ] {
+            let (_, a) = combinar(bits, &teclas, Fase::Resultado);
+            assert!(a.iniciar);
+        }
     }
 
     #[test]
-    fn enter_correndo_nao_faz_nada() {
+    fn start_correndo_nao_faz_nada() {
         // Sem isso, apertar start no meio da corrida reiniciaria a partida e o
-        // jogador perderia o progresso sem entender.
-        let teclas = Teclas {
-            enter: true,
-            ..sem_teclas()
-        };
-        let (_, a) = combinar(0, &teclas, Fase::Correndo);
-        assert!(!a.comecar && !a.reiniciar);
+        // jogador perderia o progresso sem entender. Quem decide é o laço, que
+        // só olha `iniciar` fora de `Correndo` — este teste garante que a fusão
+        // não inventa a ação sozinha em outra fase.
+        let (_, a) = combinar(evdev::INICIAR, &sem_teclas(), Fase::Correndo);
+        assert!(a.iniciar, "a fusão reporta o nível; o laço é que filtra");
     }
 
     #[test]
-    fn esc_e_select_saem_em_qualquer_fase() {
+    fn o_cursor_do_menu_so_se_move_no_titulo() {
+        for fase in [Fase::Correndo, Fase::Resultado] {
+            let (_, a) = combinar(evdev::CIMA | evdev::ESQUERDA, &sem_teclas(), fase);
+            assert_eq!(a.navegar, 0, "{fase:?}");
+            assert_eq!(a.ajustar, 0, "{fase:?}");
+        }
+        let (_, a) = combinar(evdev::CIMA | evdev::ESQUERDA, &sem_teclas(), Fase::Titulo);
+        assert_eq!(a.navegar, -1);
+        assert_eq!(a.ajustar, -1);
+        let (_, a) = combinar(evdev::BAIXO | evdev::DIREITA, &sem_teclas(), Fase::Titulo);
+        assert_eq!(a.navegar, 1);
+        assert_eq!(a.ajustar, 1);
+    }
+
+    #[test]
+    fn o_a_aceita_e_o_x_liga_o_perfil() {
+        let (_, a) = combinar(evdev::ACEITAR, &sem_teclas(), Fase::Titulo);
+        assert!(a.aceitar);
+        assert!(!a.perfil, "o A não abre o overlay");
+        let (_, a) = combinar(evdev::PERFIL, &sem_teclas(), Fase::Correndo);
+        assert!(a.perfil);
+        assert!(!a.aceitar, "o X não aceita");
+    }
+
+    #[test]
+    fn esc_e_y_voltam_em_qualquer_fase() {
         for fase in [Fase::Titulo, Fase::Correndo, Fase::Resultado] {
             let teclas = Teclas {
                 escape: true,
                 ..sem_teclas()
             };
             let (_, a) = combinar(0, &teclas, fase);
-            assert!(a.sair, "{fase:?}");
-            let (_, a) = combinar(evdev::SAIR, &sem_teclas(), fase);
-            assert!(a.sair, "{fase:?} pelo controle");
+            assert!(a.voltar, "{fase:?}");
+            let (_, a) = combinar(evdev::VOLTAR, &sem_teclas(), fase);
+            assert!(a.voltar, "{fase:?} pelo controle");
         }
+    }
+
+    #[test]
+    fn a_borda_nao_repete_o_passo_segurado() {
+        // O defeito medido: com `--teclas right`, quatro quadros davam quatro
+        // trocas de mapa. A borda transforma "segurando" em "apertou agora".
+        let apertou = Acoes {
+            ajustar: 1,
+            navegar: 1,
+            aceitar: true,
+            iniciar: true,
+            voltar: true,
+            perfil: true,
+        };
+        let primeira = bordas(Acoes::default(), apertou);
+        assert_eq!(primeira.ajustar, 1);
+        assert_eq!(primeira.navegar, 1);
+        assert!(primeira.aceitar && primeira.iniciar && primeira.voltar && primeira.perfil);
+
+        let segunda = bordas(apertou, apertou);
+        assert_eq!(segunda, Acoes::default(), "segurar não repete a ação");
+
+        // Soltar e apertar de novo conta como ação nova.
+        let soltou = bordas(apertou, Acoes::default());
+        assert_eq!(soltou, Acoes::default(), "soltar não é ação");
+        let terceira = bordas(Acoes::default(), apertou);
+        assert!(terceira.aceitar && terceira.iniciar);
+    }
+
+    #[test]
+    fn a_borda_deixa_passar_a_mudanca_de_valor() {
+        // Segurar a esquerda e depois a direita (sem soltar a primeira) muda o
+        // nível de -1 para +1: é uma ação nova e tem de passar.
+        let esquerda = Acoes {
+            ajustar: -1,
+            ..Acoes::default()
+        };
+        let ambos = Acoes {
+            ajustar: 0,
+            ..Acoes::default()
+        };
+        assert_eq!(bordas(esquerda, ambos).ajustar, 0, "cancelou: nada a fazer");
+        assert_eq!(bordas(ambos, esquerda).ajustar, -1);
     }
 
     #[test]
@@ -278,18 +446,75 @@ mod testes {
     }
 
     #[test]
-    fn seta_no_titulo_troca_de_mapa_e_na_corrida_vira_volante() {
+    fn seta_no_titulo_ajusta_o_valor_e_na_corrida_vira_volante() {
         let esq = Teclas {
             esquerda: true,
             ..sem_teclas()
         };
         let (_, a) = combinar(0, &esq, Fase::Titulo);
-        assert_eq!(a.trocar_mapa, -1);
+        assert_eq!(a.ajustar, -1);
         let (e, a) = combinar(0, &esq, Fase::Correndo);
-        assert_eq!(a.trocar_mapa, 0, "na corrida a seta é volante, não menu");
+        assert_eq!(a.ajustar, 0, "na corrida a seta é volante, não menu");
         assert_eq!(e.virar, -1.0);
 
         let (_, a) = combinar(evdev::DIREITA, &sem_teclas(), Fase::Titulo);
-        assert_eq!(a.trocar_mapa, 1, "o direcional do controle também escolhe");
+        assert_eq!(a.ajustar, 1, "o direcional do controle também escolhe");
+    }
+
+    #[test]
+    fn o_gatilho_acelera_proporcionalmente() {
+        let analógico = Analogico {
+            acelerar: 0.42,
+            ..Analogico::default()
+        };
+        let (e, _) = combinar_com_analogico(0, analógico, &sem_teclas(), Fase::Correndo);
+        assert!((e.acelerar - 0.42).abs() < 1e-6);
+        assert_eq!(e.frear, 0.0);
+    }
+
+    #[test]
+    fn teclado_e_gatilho_nao_somam_alem_de_um() {
+        let analógico = Analogico {
+            acelerar: 0.8,
+            ..Analogico::default()
+        };
+        let teclas = Teclas {
+            cima: true,
+            ..sem_teclas()
+        };
+        let (e, _) = combinar_com_analogico(0, analógico, &teclas, Fase::Correndo);
+        assert_eq!(e.acelerar, 1.0);
+    }
+
+    #[test]
+    fn o_analogico_vira_e_a_soma_fica_no_limite() {
+        let analógico = Analogico {
+            virar: 0.75,
+            ..Analogico::default()
+        };
+        let (e, _) = combinar_com_analogico(0, analógico, &sem_teclas(), Fase::Correndo);
+        assert!((e.virar - 0.75).abs() < 1e-6);
+
+        let teclas = Teclas {
+            direita: true,
+            ..sem_teclas()
+        };
+        let (e, _) = combinar_com_analogico(0, analógico, &teclas, Fase::Correndo);
+        assert_eq!(e.virar, 1.0, "duas fontes no mesmo sentido não passam de 1");
+    }
+
+    #[test]
+    fn o_analogico_nao_escolhe_mapa_no_titulo() {
+        // O stick analógico é volante, não menu: no título ele não pode trocar
+        // de pista a cada quadro por causa de ruído de repouso. Quem navega é o
+        // **direcional**, que é discreto e tem borda.
+        let analógico = Analogico {
+            virar: 0.9,
+            acelerar: 0.9,
+            frear: 0.9,
+        };
+        let (_, a) = combinar_com_analogico(0, analógico, &sem_teclas(), Fase::Titulo);
+        assert_eq!(a.ajustar, 0);
+        assert_eq!(a.navegar, 0);
     }
 }

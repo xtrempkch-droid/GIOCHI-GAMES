@@ -123,6 +123,20 @@ impl Som {
         self.fila.is_some() && self.ganho > 0.0
     }
 
+    /// Nome pedido pelo contrato da engine: sem dispositivo, o jogo segue mudo.
+    pub fn is_available(&self) -> bool {
+        self.ativo()
+    }
+
+    /// Para a fila e fecha o dispositivo. Idempotente.
+    pub fn encerrar(&mut self) {
+        if let Some(fila) = self.fila.take() {
+            fila.pause();
+            fila.clear();
+        }
+        self.ganho = 0.0;
+    }
+
     /// Avança o som `dt` segundos e enfileira as amostras correspondentes.
     pub fn atualizar(&mut self, estado: &EstadoSom, dt: f32) {
         if !self.ativo() {

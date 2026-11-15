@@ -14,22 +14,31 @@
 //! com alguém olhando a tela: o `--teclas` do launcher passou 223 testes verdes
 //! imprimindo um estado que não tinha mudado.
 
+#![forbid(unsafe_code)]
+
 mod atlas;
 mod audio;
 mod cena3d;
 mod efeitos;
-mod texturas;
 mod entrada_jogo;
 mod evdev;
+mod gamepad;
 mod malha;
+mod menu;
+mod modelos;
+mod perfil;
+mod rede;
+mod texturas;
 mod vetor;
 mod video;
 
-use std::time::Instant;
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use audio::{EstadoSom, Som};
 use cena3d::Cena3D;
-use entrada_jogo::{Acoes, Teclas};
+use entrada_jogo::Teclas;
+use gamepad::Gamepad;
 use giochi_engine::platform::sdl::Platform;
 use giochi_engine::platform::window::{Window, WindowConfig};
 use giochi_engine_3d::context::{self, GlesVersion};
@@ -39,10 +48,13 @@ use giochi_neon_drift_core::corrida::{Corrida, Evento, Fase};
 use giochi_neon_drift_core::dificuldade::Dificuldade;
 use giochi_neon_drift_core::relogio::{ALVO_FPS, MAX_FPS, TIQUE};
 use giochi_neon_drift_core::{hud, Relogio};
+use perfil::Perfil;
+use rede::{Papel, Rede};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::surface::Surface;
+use video::Rotacao;
 
 const VERSAO: &str = env!("CARGO_PKG_VERSION");
 
@@ -67,6 +79,12 @@ struct Opcoes {
     /// `s` onde o carro começa, em metros (`--em`).
     em: Option<f32>,
     teclas: Teclas,
+    /// Toques simulados, um por dois quadros (aperta, solta).
+    teclas_ciclo: Option<Vec<Teclas>>,
+    /// Botões de controle segurados, como máscara (`--botoes`).
+    botoes: u32,
+    /// Toques de botão, um por dois quadros (`--botoes-ciclo "a;baixo;a"`).
+    botoes_ciclo: Option<Vec<u32>>,
     tela: Option<Fase>,
     fps: u32,
     json: bool,
@@ -78,6 +96,14 @@ struct Opcoes {
     dificuldade: Option<String>,
     sem_vsync: bool,
     escala: f32,
+    /// Sobe um host de corrida LAN.
+    lan_host: bool,
+    /// Entra num host LAN no endereço dado (`ip[:porta]`).
+    lan_entrar: Option<String>,
+    /// Procura um lobby por mDNS antes de abrir a corrida.
+    lan_procurar: bool,
+    /// Porta do host LAN (padrão: `giochi_net::PORTA_PADRAO`).
+    lan_porta: Option<u16>,
     ajuda: bool,
     versao: bool,
 }
@@ -94,6 +120,9 @@ impl Default for Opcoes {
             em: None,
             texturas: None,
             teclas: Teclas::default(),
+            teclas_ciclo: None,
+            botoes: 0,
+            botoes_ciclo: None,
             tela: None,
             fps: ALVO_FPS,
             json: false,
@@ -107,6 +136,10 @@ impl Default for Opcoes {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1.0),
+            lan_host: false,
+            lan_entrar: None,
+            lan_procurar: false,
+            lan_porta: None,
             ajuda: false,
             versao: false,
         }
@@ -159,7 +192,7 @@ fn opcoes(argv: Vec<String>) -> Result<Opcoes, String> {
                 o.tamanho = Some(tamanho);
                 i += 2;
             }
-            "--quadros" => {
+            "--quadros" | "--frames" => {
                 let n: u32 = argv
                     .get(i + 1)
                     .ok_or("--quadros sem valor")?
@@ -196,6 +229,40 @@ fn opcoes(argv: Vec<String>) -> Result<Opcoes, String> {
                 o.teclas = teclas(valor)?;
                 i += 2;
             }
+            // `--teclas` deixa a tecla **segurando** para sempre, e o laço trata
+            // cada ação como borda: segurar move o cursor **uma** linha. Para
+            // provar "apertei cinco vezes" (navegar o menu, confirmar a LAN) é
+            // preciso soltar entre os toques, que é o que este ciclo faz.
+            //
+            // A lista é separada por `;` e cada pedaço é **um** toque:
+            // `--teclas-ciclo "down;down;a"` desce duas linhas e confirma.
+            // Botões do **controle**, não do teclado. Existem porque o teclado
+            // não é mais o caminho principal: sem isto, provar por script que o
+            // A do controle navega o menu seria impossível — e `--teclas a`
+            // significa "acelerar" (seta para cima), não "botão A".
+            "--botoes" => {
+                let valor = argv.get(i + 1).ok_or("--botoes sem valor")?;
+                o.botoes = botoes_de_lista(valor)?;
+                i += 2;
+            }
+            "--botoes-ciclo" => {
+                let valor = argv.get(i + 1).ok_or("--botoes-ciclo sem valor")?;
+                let mut toques = Vec::new();
+                for pedaco in valor.split(';') {
+                    toques.push(botoes_de_lista(pedaco)?);
+                }
+                o.botoes_ciclo = Some(toques);
+                i += 2;
+            }
+            "--teclas-ciclo" => {
+                let valor = argv.get(i + 1).ok_or("--teclas-ciclo sem valor")?;
+                let mut toques = Vec::new();
+                for pedaco in valor.split(';') {
+                    toques.push(teclas(pedaco)?);
+                }
+                o.teclas_ciclo = Some(toques);
+                i += 2;
+            }
             "--tela" => {
                 let valor = argv.get(i + 1).ok_or("--tela sem valor")?;
                 o.tela = Some(match valor.as_str() {
@@ -216,6 +283,30 @@ fn opcoes(argv: Vec<String>) -> Result<Opcoes, String> {
                     return Err(format!("--fps-teto precisa ficar entre 1 e {MAX_FPS}"));
                 }
                 o.fps = fps;
+                i += 2;
+            }
+            "--lan-host" => {
+                o.lan_host = true;
+                i += 1;
+            }
+            "--lan-entrar" => {
+                o.lan_entrar = Some(argv.get(i + 1).ok_or("--lan-entrar sem endereço")?.clone());
+                i += 2;
+            }
+            "--lan-procurar" => {
+                o.lan_procurar = true;
+                i += 1;
+            }
+            "--lan-porta" => {
+                let porta: u16 = argv
+                    .get(i + 1)
+                    .ok_or("--lan-porta sem valor")?
+                    .parse()
+                    .map_err(|_| "--lan-porta espera um número de 1 a 65534")?;
+                if porta == 0 {
+                    return Err("--lan-porta não aceita 0".into());
+                }
+                o.lan_porta = Some(porta);
                 i += 2;
             }
             "--json" => {
@@ -286,6 +377,33 @@ fn teclas(valor: &str) -> Result<Teclas, String> {
         }
     }
     Ok(t)
+}
+
+/// Botões de controle a partir de uma lista (`a,b,start`), para diagnóstico.
+///
+/// O vocabulário é o do plástico, não o do bit: quem escreve o script pensa "o
+/// A", não "ACEITAR". `a` acende os dois bits do botão A (acelerar e aceitar),
+/// exatamente como o `evdev` faz.
+fn botoes_de_lista(valor: &str) -> Result<u32, String> {
+    use evdev as b;
+    let mut mascara = 0;
+    for nome in valor.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        mascara |= match nome {
+            "a" | "acelerar" | "aceitar" => b::ACELERAR | b::ACEITAR,
+            "b" | "frear" => b::FREAR,
+            "x" | "perfil" => b::PERFIL,
+            "y" | "select" | "voltar" => b::VOLTAR,
+            "start" | "iniciar" => b::INICIAR,
+            "l1" | "r1" | "derrapar" => b::FREIO_MAO,
+            "l2" | "r2" | "nitro" => b::NITRO,
+            "cima" => b::CIMA,
+            "baixo" => b::BAIXO,
+            "esq" | "esquerda" => b::ESQUERDA,
+            "dir" | "direita" => b::DIREITA,
+            outro => return Err(format!("botão desconhecido: {outro}")),
+        };
+    }
+    Ok(mascara)
 }
 
 /// Estado da corrida em uma linha, para o `--json`.
@@ -369,31 +487,39 @@ Uso:
   giochi-neon-drift --em 1240 --teclas up   começar o carro em 1 240 m da volta
   giochi-neon-drift --piloto                o piloto artificial dirige nos --passos
   giochi-neon-drift --teclas a,right,shift  teclas seguradas
+  giochi-neon-drift --teclas-ciclo down;down;a
+                                            toques de tecla (; = um toque)
+  giochi-neon-drift --botoes a,start        botões de controle segurados
+  giochi-neon-drift --botoes-ciclo baixo;baixo;a
+                                            toques de botão do controle
   giochi-neon-drift --tela resultado        forçar uma tela
   giochi-neon-drift --fps-teto 75           limite: 1 a 75 (é também o padrão)
   giochi-neon-drift --sem-som               sem áudio
   giochi-neon-drift --mapa boavista         escolhe o mapa (avenida, boavista)
   giochi-neon-drift --so asfalto            desenha uma malha só (diagnóstico)
-  giochi-neon-drift --texturas t.bmp        grava a folha das 7 texturas e sai
+  giochi-neon-drift --texturas t.bmp        grava a folha das 9 texturas e sai
   giochi-neon-drift --atlas a.bmp           grava o atlas de sprites e sai
   giochi-neon-drift --prova-rotacao r.bmp   grava a prova de orientação e sai
   GIOCHI_SPRITES=x.bmp GIOCHI_SPRITES_COLUNAS=8
                                             usa a sua folha de sprites (BMP)
+  giochi-neon-drift --frames 300             idem `--quadros` (nome de smoke test)
+  giochi-neon-drift --lan-host               hospeda uma corrida LAN (mDNS)
+  giochi-neon-drift --lan-entrar 192.168.0.9 entra num host (porta padrão 47721)
+  giochi-neon-drift --lan-procurar           descobre um lobby por mDNS e entra
+  giochi-neon-drift --lan-porta 47721        porta do host (controle = porta+1)
   giochi-neon-drift --json                  saída de máquina (stdout é só o JSON)
   giochi-neon-drift --versao
 
-Controles: WASD/setas, ESPACO freio de mao, SHIFT nitro, ENTER, ESC.
+Controles (o gamepad e o caminho principal; o teclado e o atalho):
+  A/gatilho direito acelera, B/gatilho esquerdo freia, analogico/direcional vira,
+  L1/R1 freio de mao (drift), L2/R2 nitro, X overlay, START jogar/reiniciar,
+  Y/SELECT volta ao menu (no menu, sai).
+Menu do titulo: direcional cima/baixo escolhe a linha, esq/dir muda o valor, A aceita.
+  MAPA, DIFICULDADE, QUALIDADE (escala de render), PERFIL, LAN, JOGAR.
+Teclado: WASD/setas, ESPACO freio de mao, SHIFT nitro, ENTER jogar, ESC sair;
+  H hospeda a LAN, J entra, F3 escala, F1 overlay, -/= mudam o valor do menu.
 GIOCHI_GL_VERSION=2 solicita GLES 2.0; o padrão pede 3.0 com queda para 2.0."
     );
-}
-
-fn restaurar_sigpipe() {
-    // Escrever num pipe fechado (`--json | head`) não pode matar o processo no
-    // meio do desenho: o Rust ignora SIGPIPE por padrão, mas o SDL instala o
-    // handler de C, que encerra.
-    unsafe {
-        libc::signal(libc::SIGPIPE, 0);
-    }
 }
 
 fn painel(plataforma: &Platform, o: &Opcoes) -> Result<(u32, u32), String> {
@@ -421,16 +547,15 @@ fn criar_render(
     // vsync, todo quadro mais barato que 16,7 ms mede "59,9 fps" e não dá para
     // saber se sobrou folga ou se faltou 1 ms. Sem vsync o número passa a ser o
     // custo real do quadro — é o que permite decidir se um efeito novo cabe.
+    let render = RenderContext3D::new(context::create(&janela)?);
     if sem_vsync {
-        // No `sdl2` 0.38 o `gl_set_swap_interval` mora no `WindowBuilder`, não no
-        // `Window` — e a engine já criou a janela. Vai pela função C, que é a
-        // mesma que o builder chamaria.
-        let r = unsafe { sdl2::sys::SDL_GL_SetSwapInterval(0) };
-        if r != 0 {
-            eprintln!("aviso: não consegui desligar o vsync ({})", sdl2::get_error());
+        // O vsync pertence ao contexto GL, e o `sdl2` 0.38 expõe a troca em
+        // `VideoSubsystem` — não na janela. Chamar a função C crua exigiria
+        // `unsafe`, proibido no jogo (`#![forbid(unsafe_code)]`).
+        if let Err(erro) = plataforma.video_subsystem().gl_set_swap_interval(0) {
+            eprintln!("aviso: não consegui desligar o vsync ({erro})");
         }
     }
-    let render = RenderContext3D::new(context::create(&janela)?);
     Ok((janela, render))
 }
 
@@ -464,13 +589,15 @@ fn gravar_quadro(
 
 /// Grava a folha das texturas procedurais em BMP, sem abrir janela.
 ///
-/// Uma tira horizontal com as sete texturas lado a lado, na ordem de
+/// Uma tira horizontal com as nove texturas lado a lado, na ordem de
 /// `texturas::todas()`, com uma faixa escura de separação. Serve de **molde**:
 /// quem quiser desenhar a própria textura pinta em cima destas células, com o
 /// mesmo tamanho e a mesma densidade, e o resultado entra no jogo sem ajuste.
 ///
-/// Não há carregamento de textura externa hoje — o leitor seria mais código do
-/// que as sete fórmulas juntas. O que existe é a referência para pintar.
+/// A folha é o **molde**: quem pinta a versão dele põe o arquivo em
+/// `GIOCHI_TEXTURAS=<dir>` com o nome do material (`asfalto.png`, …) e o jogo o
+/// carrega por `render.create_texture`. O que não existir continua vindo da
+/// fórmula, e o log diz material por material qual foi o caminho.
 fn gravar_texturas(caminho: &str) -> Result<(), Box<dyn std::error::Error>> {
     let lista = texturas::todas();
     let lado = texturas::LADO;
@@ -583,8 +710,228 @@ fn estado_som(corrida: &Corrida) -> EstadoSom {
     }
 }
 
+/// Sobe a sessão de rede pedida na linha de comando, se houver.
+fn criar_rede(o: &Opcoes) -> Result<Rede, String> {
+    if o.lan_host {
+        return Rede::hospedar(o.lan_porta);
+    }
+    if let Some(texto) = &o.lan_entrar {
+        let endereco = endereco_lan(texto)?;
+        return Rede::entrar(endereco);
+    }
+    if o.lan_procurar {
+        let endereco = Rede::procurar(Duration::from_secs(3))?;
+        return Rede::entrar(endereco);
+    }
+    Ok(Rede::off())
+}
+
+/// Aceita `ip`, `ip:porta` ou um nome resolvível.
+fn endereco_lan(texto: &str) -> Result<SocketAddr, String> {
+    let texto = texto.trim();
+    if let Ok(endereco) = texto.parse::<SocketAddr>() {
+        return Ok(endereco);
+    }
+    if let Ok(ip) = texto.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, giochi_net::PORTA_PADRAO));
+    }
+    // Nome de máquina: resolve uma vez, no boot, e não no laço.
+    use std::net::ToSocketAddrs;
+    (texto, giochi_net::PORTA_PADRAO)
+        .to_socket_addrs()
+        .map_err(|e| format!("--lan-entrar '{texto}': {e}"))?
+        .next()
+        .ok_or_else(|| format!("--lan-entrar '{texto}': nenhum endereço"))
+}
+
+/// Aplica a escala de renderização no renderer e no overlay.
+fn definir_escala(render: &mut RenderContext3D, perfil: &mut Perfil, escala: Option<f32>) {
+    render.set_render_scale(escala);
+    perfil.definir_escala(escala);
+    let (rw, rh) = render.render_size();
+    eprintln!(
+        "neon-drift: escala {:.2} — alvo interno {rw}x{rh}",
+        escala.unwrap_or(1.0)
+    );
+}
+
+/// Rodapé do HUD: o estado da rede (quando há) e a escala em vigor.
+///
+/// A escala aparece aqui porque é o número que muda o que foi desenhado: sem
+/// ele, o jogador aperta o botão da qualidade e não vê nada acontecer além do
+/// quadro ficar mais rápido.
+fn aviso_hud(rede: &Rede, menu: &menu::Menu) -> String {
+    let mut texto = rede.aviso().to_string();
+    if !texto.is_empty() {
+        texto.push_str("  ");
+    }
+    texto.push_str(&format!(
+        "ESCALA {}  X PERFIL  START MENU",
+        menu::rotulo_escala(menu.escala())
+    ));
+    texto
+}
+
+/// Monta as linhas do menu do título e a dica da linha do cursor.
+///
+/// Existe para o laço e o `--quadro` desenharem **o mesmo** menu: duas
+/// montagens diferentes dariam uma captura de tela que não é o que o jogador
+/// vê, e foi assim que um `--quadro` já mentiu sobre o HUD.
+fn montar_menu(
+    menu: &menu::Menu,
+    corrida: &Corrida,
+    rede: &Rede,
+) -> (Vec<(String, bool)>, String) {
+    // `resumo_curto`: o `resumo` completo tem 58 caracteres e não cabe no
+    // painel de 640×480 (ele sai pelas duas bordas, porque o texto é centrado).
+    // O completo continua no overlay F1, que é onde o diagnóstico mora.
+    let resumo = rede.resumo_curto();
+    let ctx = menu::Contexto {
+        mapa: corrida.mapa.nome,
+        dificuldade: corrida.dificuldade.nome(),
+        dificuldade_dica: corrida.dificuldade.descricao(),
+        rede: &resumo,
+    };
+    let dica = menu.dica(&ctx, rede.ativo());
+    (menu.linhas(&ctx), dica)
+}
+
+/// Troca de mapa: o mapa é **construtivo** (define pista, relevo, voltas,
+/// cenário e até as malhas), então trocar é reconstruir a corrida e a cena.
+///
+/// `release_all`/`destruir` antes liberam as malhas e texturas do mapa anterior;
+/// sem isso cada troca deixaria um mundo pendurado na GPU.
+fn trocar_mapa(
+    passo: i32,
+    indice_mapa: &mut usize,
+    corrida: &mut Corrida,
+    cena: &mut Cena3D,
+    render: &mut RenderContext3D,
+    rotacao: Rotacao,
+    o: &Opcoes,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let total = giochi_neon_drift_core::mapa::TODOS.len() as i32;
+    let novo = ((*indice_mapa as i32 + passo).rem_euclid(total)) as usize;
+    if novo == *indice_mapa {
+        return Ok(());
+    }
+    *indice_mapa = novo;
+    let mapa = giochi_neon_drift_core::mapa::TODOS[novo];
+    *corrida = Corrida::com_mapa_e_dificuldade(mapa, corrida.dificuldade);
+    // Destruição explícita do mundo anterior: cada textura e malha tem de passar
+    // pelos `destroy_*`, não só pelo `release_all`.
+    cena.destruir(render);
+    // O buffer de instâncias também foi junto. Sem recriar, o mundo novo desenha
+    // carros e partículas **empilhados na origem** — medido antes desta linha:
+    // 50 desenhos por quadro antes da troca, 30 depois, porque `desenhar_carros`
+    // e `desenhar_particulas` desistem sem instancing.
+    render.rebuild_instancing();
+    *cena = Cena3D::nova(render, &corrida.pista, rotacao, mapa.cenario)?;
+    cena.so(o.so.clone());
+    if !o.json {
+        eprintln!(
+            "neon-drift: mapa \"{}\" ({}) — pista {:.0} m, desnível {:.0} m",
+            mapa.nome,
+            mapa.id,
+            corrida.pista.comprimento(),
+            mapa.desnivel()
+        );
+    }
+    Ok(())
+}
+
+/// Abre um lobby ou entra num, pelo mesmo caminho do menu e das teclas.
+fn abrir_lan(acao: menu::AcaoLan, porta: Option<u16>) -> Result<Rede, String> {
+    match acao {
+        menu::AcaoLan::Nada => Ok(Rede::off()),
+        menu::AcaoLan::Hospedar => Rede::hospedar(porta),
+        // O `procurar` bloqueia por até 3 s: é o preço de não ter teclado para
+        // digitar um IP, e é o que o mDNS compra.
+        menu::AcaoLan::Entrar => Rede::procurar(Duration::from_secs(3)).and_then(Rede::entrar),
+    }
+}
+
+/// Aplica **um** pedido do menu. É o único lugar que muda o jogo por escolha do
+/// jogador — teclado, controle e `--passos` passam todos por aqui.
+#[allow(clippy::too_many_arguments)]
+fn aplicar_pedido(
+    pedido: menu::Pedido,
+    menu: &mut menu::Menu,
+    perfil: &mut Perfil,
+    render: &mut RenderContext3D,
+    corrida: &mut Corrida,
+    indice_mapa: &mut usize,
+    cena: &mut Cena3D,
+    rotacao: Rotacao,
+    o: &Opcoes,
+    rede: &mut Rede,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match pedido {
+        menu::Pedido::Nada => {}
+        menu::Pedido::Jogar => corrida.comecar(),
+        menu::Pedido::Escala(escala) => {
+            menu.definir_escala(escala);
+            definir_escala(render, perfil, escala);
+        }
+        menu::Pedido::Perfil(ligado) => {
+            menu.definir_perfil(ligado);
+            perfil.definir_visivel(ligado);
+        }
+        // Mapa e dificuldade não se mexem com a LAN no ar: num host-autoritativo
+        // a pista é do host, e trocá-la no cliente desenharia outro mundo.
+        menu::Pedido::Mapa(passo) => {
+            if corrida.fase == Fase::Titulo && !rede.ativo() {
+                trocar_mapa(passo, indice_mapa, corrida, cena, render, rotacao, o)?;
+            }
+        }
+        menu::Pedido::Dificuldade(passo) => {
+            if corrida.fase == Fase::Titulo && !rede.ativo() {
+                let mut nova = corrida.dificuldade;
+                for _ in 0..passo.abs() {
+                    nova = if passo > 0 {
+                        nova.proxima()
+                    } else {
+                        nova.anterior()
+                    };
+                }
+                if nova != corrida.dificuldade {
+                    corrida.definir_dificuldade(nova);
+                    if !o.json {
+                        eprintln!("neon-drift: dificuldade {} ({})", nova.nome(), nova.descricao());
+                    }
+                }
+            }
+        }
+        menu::Pedido::Hospedar | menu::Pedido::Entrar => {
+            if corrida.fase != Fase::Titulo || rede.ativo() {
+                return Ok(());
+            }
+            let acao = if pedido == menu::Pedido::Hospedar {
+                menu::AcaoLan::Hospedar
+            } else {
+                menu::AcaoLan::Entrar
+            };
+            match abrir_lan(acao, o.lan_porta) {
+                Ok(nova) => {
+                    *rede = nova;
+                    perfil.definir_rede(rede.resumo());
+                }
+                Err(erro) => eprintln!("neon-drift: LAN {acao:?} falhou: {erro}"),
+            }
+        }
+        menu::Pedido::DesligarLan => {
+            *rede = Rede::off();
+            perfil.definir_rede(rede.resumo());
+            cena.definir_carros_rede(Vec::new(), true);
+            if !o.json {
+                eprintln!("neon-drift: LAN desligada");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn principal() -> Result<i32, Box<dyn std::error::Error>> {
-    restaurar_sigpipe();
     let o = opcoes(std::env::args().skip(1).collect())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     if o.ajuda {
@@ -654,12 +1001,19 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
     // painel de 720×1280 são 921 mil pixels por quadro, e o Mali-G52 gasta
     // proporcionalmente ao **pixel**, não ao triângulo — é o botão que troca
     // nitidez por quadro em qualquer aparelho, com um número só.
-    if o.escala < 0.999 {
-        render.set_render_scale(Some(o.escala.clamp(0.25, 1.0)));
+    // A escala vive no `menu`: é ele que desenha `QUALIDADE [ 0.75 ]` na tela e
+    // é ele que o direcional ajusta. Duas cópias do mesmo número divergiriam no
+    // primeiro caminho que esquecesse de sincronizar.
+    let mut menu = menu::Menu::com_escala(if o.escala < 0.999 {
+        Some(o.escala.clamp(0.25, 1.0))
+    } else {
+        None
+    });
+    if let Some(escala) = menu.escala() {
+        render.set_render_scale(Some(escala));
         let (rw, rh) = render.render_size();
         eprintln!(
-            "neon-drift: escala {:.2} — desenhando em {rw}x{rh} e esticando para {largura}x{altura}",
-            o.escala
+            "neon-drift: escala {escala:.2} — desenhando em {rw}x{rh} e esticando para {largura}x{altura}"
         );
     }
 
@@ -774,12 +1128,31 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
     } else {
         Som::iniciar(&plataforma)
     };
+    let mut rede = criar_rede(&o).map_err(std::io::Error::other)?;
+    let mut gamepad = Gamepad::iniciar(&plataforma);
+    let mut perfil = Perfil::novo();
+    // `GIOCHI_PERFIL=1` liga o overlay já no boot: é o que permite capturar
+    // um `--quadro` com o F1 ligado sem dedo no aparelho (e sem tecla no PC).
+    if std::env::var_os("GIOCHI_PERFIL").is_some() {
+        perfil.alternar();
+    }
+    perfil.definir_escala(menu.escala());
+    perfil.definir_rede(rede.resumo());
+    if gamepad.ativo() {
+        eprintln!(
+            "neon-drift: gamepad aberto: {}",
+            gamepad.nome().unwrap_or("?")
+        );
+    }
+    if !som.is_available() {
+        eprintln!("neon-drift: áudio indisponível — drift e turbo ficam mudos");
+    }
 
     // `--passos` antes do laço: é o que permite capturar um quadro com a corrida
     // em andamento (drift, nitro, HUD cheio) sem dedo no aparelho.
     if o.passos > 0 {
         let (entrada, acoes) = entrada_jogo::combinar(0, &o.teclas, corrida.fase);
-        if acoes.comecar {
+        if acoes.iniciar {
             corrida.comecar();
         }
         // `--piloto` dirige no lugar das teclas fixas. Sem ele, `--passos 900`
@@ -803,9 +1176,12 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
 
     let mut teclas = o.teclas;
     let mut sair = false;
-    // Último `trocar_mapa` visto, para trocar só na borda.
-    let mut ultima_troca = 0i32;
-    let mut ultima_dificuldade = 0i32;
+    // Ações do quadro anterior, para transformar nível em borda.
+    let mut ultimas_acoes = entrada_jogo::Acoes::default();
+    // O que as teclas e o controle pediram **neste** quadro. Aplicado depois de
+    // acumular, porque aplicar um pedido de mapa reconstrói a cena inteira.
+    let mut pedidos: Vec<menu::Pedido> = Vec::with_capacity(4);
+    let mut avisou_erro_rede = false;
     let mut relogio = Relogio::com_ritmo(TIQUE, o.fps);
 
     // Prova de rotação: desenha três barras e sai. Roda antes de tudo porque não
@@ -816,6 +1192,7 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         cena.desenhar_prova_rotacao(&mut render)?;
         let (w, h) = gravar_quadro(&render, caminho)?;
         render.end_frame(&janela);
+        cena.destruir(&mut render);
         if o.json {
             println!(
                 "{{\"prova\":\"gravada\",\"largura\":{w},\"altura\":{h},\"rotacao\":\"{}\",\"fonte\":\"{}\"}}",
@@ -828,6 +1205,16 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
 
     // Quadro único: captura e sai, sem laço de eventos.
     if let Some(caminho) = &o.quadro {
+        // O overlay e o aviso também entram na captura: é o que permite
+        // conferir o F1 e o rodapé de LAN num `--quadro` headless, sem tecla.
+        if perfil.visivel() {
+            perfil.inicio_quadro();
+            perfil.fim_quadro(render.frame_counters());
+        }
+        cena.definir_perfil(perfil.linhas().to_vec());
+        cena.definir_aviso_rede(Some(aviso_hud(&rede, &menu)));
+        let (linhas_menu, dica) = montar_menu(&menu, &corrida, &rede);
+        cena.definir_menu(linhas_menu, dica);
         cena.preparar(&mut render);
         render.begin_frame(&janela);
         cena.desenhar(&mut render, &corrida, 1.0 / TIQUE)?;
@@ -839,9 +1226,13 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         }
         if o.json {
             println!(
-                "{{\"quadro\":\"gravado\",\"largura\":{w},\"altura\":{h},\"gles\":{},\"instancing\":{},\"desenhos\":{},\"fase\":\"{:?}\",\"efeitos\":{{{}}},{}}}",
+                "{{\"quadro\":\"gravado\",\"largura\":{w},\"altura\":{h},\"gles\":{},\"instancing\":{},\"escala\":{:.2},\"lan\":\"{:?}\",\"veu\":{:.2},\"batches\":{},\"desenhos\":{},\"fase\":\"{:?}\",\"efeitos\":{{{}}},{}}}",
                 render.gles_version().major(),
                 cena.usa_instancing(),
+                menu::rotulo_escala(menu.escala()).parse::<f32>().unwrap_or(1.0),
+                rede.papel(),
+                cena.veu(),
+                cena.batches(),
                 render.frame_counters().draw_calls,
                 corrida.fase,
                 cena.efeitos_json(),
@@ -850,7 +1241,7 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         } else {
             eprintln!("neon-drift: quadro {w}x{h} gravado em {caminho}");
         }
-        render.release_all();
+        cena.destruir(&mut render);
         return Ok(0);
     }
 
@@ -870,7 +1261,42 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
                     repeat: false,
                     ..
                 } => {
-                    aplicar_tecla(&mut teclas, tecla, true);
+                    // O teclado continua sendo um caminho completo, com as
+                    // mesmas ações do menu — mas ele **não** é mais o caminho
+                    // principal: num handheld não existe teclado, e cada tecla
+                    // daqui tem de ter um botão equivalente na tela.
+                    //
+                    // O pedido é **acumulado** e aplicado depois do laço de
+                    // eventos: aplicar no meio exigiria emprestar a cena, o
+                    // renderer e a corrida de dentro do `poll_events`, e a
+                    // primeira tecla que reconstruísse a pista deixaria o resto
+                    // do laço com um empréstimo aberto.
+                    match tecla {
+                        Keycode::F1 => {
+                            let ligado = menu.alternar_perfil();
+                            perfil.definir_visivel(ligado);
+                        }
+                        Keycode::F3 => {
+                            let nova = menu::proxima_escala(menu.escala());
+                            pedidos.push(menu::Pedido::Escala(nova));
+                        }
+                        Keycode::Minus if corrida.fase == Fase::Titulo => {
+                            pedidos.push(menu.ajustar(-1));
+                        }
+                        Keycode::Equals if corrida.fase == Fase::Titulo => {
+                            pedidos.push(menu.ajustar(1));
+                        }
+                        // H e J continuam: são o caminho curto de quem tem
+                        // teclado, e o equivalente do controle é a linha LAN do
+                        // menu (escolher com o direcional, executar com A).
+                        Keycode::H if corrida.fase == Fase::Titulo && !rede.ativo() => {
+                            pedidos.push(menu::Pedido::Hospedar);
+                        }
+                        Keycode::J if corrida.fase == Fase::Titulo && !rede.ativo() => {
+                            pedidos.push(menu::Pedido::Entrar);
+                        }
+                        _ => aplicar_tecla(&mut teclas, tecla, true),
+                    }
                 }
                 Event::KeyUp {
                     keycode: Some(tecla), ..
@@ -884,108 +1310,171 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
             break;
         }
 
+        // Toque simulado: o ciclo aperta/solta a cada quadro. Só existe para o
+        // diagnóstico headless — sem soltar, toda ação de borda acontece uma vez
+        // só e "navegar o menu" não teria como ser provado por script.
+        if let Some(toques) = &o.teclas_ciclo {
+            let toque = (quadros / 2) as usize;
+            teclas = match toques.get(toque) {
+                Some(t) if quadros % 2 == 0 => *t,
+                _ => Teclas::default(),
+            };
+        }
+        let mut botoes_simulados = o.botoes;
+        if let Some(toques) = &o.botoes_ciclo {
+            let toque = (quadros / 2) as usize;
+            botoes_simulados = match toques.get(toque) {
+                Some(m) if quadros % 2 == 0 => *m,
+                _ => 0,
+            };
+        }
         // A máscara é lida **uma** vez. Lendo duas (uma para decidir, outra
         // para qualquer uso posterior), uma borda de pressão pode cair entre as
         // duas leituras e o quadro age sobre um estado que já mudou.
-        let bits_agora = botoes.bits();
-        let (entrada, acoes) = entrada_jogo::combinar(bits_agora, &teclas, corrida.fase);
-        // Troca de mapa na tela de título: o mapa é **construtivo** (define
-        // pista, relevo, voltas, cenário e até as malhas), então trocar é
-        // reconstruir a corrida e a cena. `release_all` antes libera as malhas
-        // e texturas do mapa anterior; sem isso cada troca deixaria um mundo
-        // pendurado na GPU.
+        gamepad.atualizar();
+        let bits_agora = botoes.bits() | gamepad.bits() | botoes_simulados;
+        let (entrada, acoes) = entrada_jogo::combinar_com_analogico(
+            bits_agora,
+            gamepad.analogico(),
+            &teclas,
+            corrida.fase,
+        );
+        // Nível → borda. Segurar o direcional não pode andar seis linhas de menu
+        // por quadro, e é a única regra que o laço precisa repetir por quadro.
+        let bordas = entrada_jogo::bordas(ultimas_acoes, acoes);
+        ultimas_acoes = acoes;
+        // ── o menu, e as teclas que o atalham ───────────────────────
         //
-        // Borda, não nível: segurar a seta trocaria de mapa 75 vezes por segundo.
-        // O teste com `--teclas right` mostrou exatamente isso — quatro quadros,
-        // quatro trocas —, e uma seta segurada é o caso normal de quem está
-        // escolhendo.
-        let troca = if acoes.trocar_mapa != ultima_troca {
-            acoes.trocar_mapa
-        } else {
-            0
-        };
-        ultima_troca = acoes.trocar_mapa;
-        // Dificuldade: mesma regra de borda, e o mapa em vigor é preservado.
-        let troca_dif = if acoes.trocar_dificuldade != ultima_dificuldade {
-            acoes.trocar_dificuldade
-        } else {
-            0
-        };
-        ultima_dificuldade = acoes.trocar_dificuldade;
-        if troca_dif != 0 && corrida.fase == Fase::Titulo {
-            let mut nova = corrida.dificuldade;
-            for _ in 0..troca_dif.abs() {
-                nova = if troca_dif > 0 {
-                    nova.proxima()
-                } else {
-                    nova.anterior()
-                };
+        // Tudo o que muda mapa, dificuldade, escala, overlay ou LAN passa por
+        // `Pedido`. É o que garante que o botão do controle e a tecla façam a
+        // mesma coisa: existe **um** lugar que aplica, não um por dispositivo.
+        if bordas.navegar != 0 {
+            menu.navegar(bordas.navegar);
+        }
+        if bordas.ajustar != 0 {
+            pedidos.push(menu.ajustar(bordas.ajustar));
+        }
+        if bordas.aceitar && corrida.fase == Fase::Titulo {
+            pedidos.push(menu.aceitar(rede.ativo()));
+        }
+        if bordas.perfil {
+            let ligado = menu.alternar_perfil();
+            perfil.definir_visivel(ligado);
+        }
+        // START e Enter: jogar/reiniciar sem passar pelo cursor. É o caminho
+        // rápido de quem só quer correr — e o único que funciona no resultado,
+        // onde o menu não está na tela.
+        if bordas.iniciar {
+            match corrida.fase {
+                Fase::Titulo => pedidos.push(menu::Pedido::Jogar),
+                Fase::Resultado => {
+                    corrida.reiniciar();
+                    cena.limpar_efeitos();
+                }
+                Fase::Correndo => {}
             }
-            if nova != corrida.dificuldade {
-                corrida.definir_dificuldade(nova);
-                if !o.json {
-                    eprintln!(
-                        "neon-drift: dificuldade {} ({})",
-                        nova.nome(),
-                        nova.descricao()
-                    );
+        }
+        // O A no resultado também reinicia: é o botão que o dedo procura.
+        if bordas.aceitar && corrida.fase == Fase::Resultado {
+            corrida.reiniciar();
+            cena.limpar_efeitos();
+        }
+        // Voltar: no título fecha o jogo; na corrida e no resultado devolve ao
+        // menu. Antes o Y matava o jogo em qualquer tela — num handheld isso é
+        // um dedo escorregado longe do botão de voltar.
+        if bordas.voltar {
+            match corrida.fase {
+                Fase::Titulo => sair = true,
+                Fase::Correndo | Fase::Resultado => {
+                    // `reiniciar` **antes** de `titulo`: o título desenha o
+                    // mundo atrás do menu, e voltar com o carro parado dentro de
+                    // uma mureta a 400 m da largada parece defeito. `reiniciar`
+                    // põe o carro na linha e `titulo` troca a tela.
+                    corrida.reiniciar();
+                    corrida.titulo();
+                    cena.limpar_efeitos();
+                    if !o.json {
+                        eprintln!("neon-drift: de volta ao menu");
+                    }
                 }
             }
         }
 
-        if troca != 0 && corrida.fase == Fase::Titulo {
-            let total = giochi_neon_drift_core::mapa::TODOS.len() as i32;
-            let atual = indice_mapa as i32;
-            let novo = (atual + troca).rem_euclid(total) as usize;
-            if novo != indice_mapa {
-                indice_mapa = novo;
-                let mapa = giochi_neon_drift_core::mapa::TODOS[novo];
-                corrida = Corrida::com_mapa_e_dificuldade(mapa, corrida.dificuldade);
-                render.release_all();
-                // `release_all` leva o buffer de instâncias junto. Sem recriar,
-                // o mundo novo desenha carros e partículas **empilhados na
-                // origem** — medido antes desta linha: 50 desenhos por quadro
-                // antes da troca, 30 depois, porque `desenhar_carros` e
-                // `desenhar_particulas` desistem sem instancing.
-                render.rebuild_instancing();
-                cena = Cena3D::nova(&mut render, &corrida.pista, rotacao, mapa.cenario)?;
-                cena.so(o.so.clone());
-                if !o.json {
-                    eprintln!(
-                        "neon-drift: mapa \"{}\" ({}) — pista {:.0} m, desnível {:.0} m",
-                        mapa.nome,
-                        mapa.id,
-                        corrida.pista.comprimento(),
-                        mapa.desnivel()
-                    );
-                }
-            }
-        }
-        let reiniciou = acoes.reiniciar;
-        sair |= executar_acoes(&mut corrida, acoes);
-        if reiniciou {
-            // A fumaça da corrida anterior não pode reaparecer no ar do reinício.
-            cena.limpar_efeitos();
+        // Aplicados depois de acumular: um pedido de mapa reconstrói a cena e
+        // não pode acontecer no meio do empréstimo de outro.
+        for pedido in pedidos.drain(..) {
+            aplicar_pedido(
+                pedido,
+                &mut menu,
+                &mut perfil,
+                &mut render,
+                &mut corrida,
+                &mut indice_mapa,
+                &mut cena,
+                rotacao,
+                &o,
+                &mut rede,
+            )?;
         }
         if sair {
             break;
         }
 
+        // A rede é drenada uma vez por quadro, antes dos passos. No host isso
+        // atualiza o input de cada cliente; no cliente aplica largada/volta/
+        // resultado que chegaram pelo canal confiável.
+        rede.processar(&mut corrida);
+
         let agora = inicio.elapsed().as_secs_f64();
         let planejado = relogio.avancar(agora);
         for _ in 0..planejado.ticks {
-            let evento = corrida.passo(&entrada, 1.0 / TIQUE);
             passos_totais += 1;
+            // Cliente LAN não simula o próprio carro: a posição vem do host.
+            // A física que sobra é só a do host, dentro do mesmo passo fixo.
+            if !rede.simula_localmente() {
+                continue;
+            }
+            let evento = corrida.passo(&entrada, 1.0 / TIQUE);
             // Só a batida precisa avisar a cena; o resto ela lê do estado.
             if evento == Evento::Bateu {
                 cena.bater();
             }
+            rede.passo_host(&mut corrida, 1.0 / TIQUE);
         }
 
         let dt = ultimo.elapsed().as_secs_f32().min(0.1);
         ultimo = Instant::now();
         som.atualizar(&estado_som(&corrida), dt);
 
+        match rede.papel() {
+            Papel::Cliente => {
+                let carros = rede.aplicar_cliente(&mut corrida, &entrada, dt);
+                cena.definir_carros_rede(carros, false);
+            }
+            Papel::Host => {
+                let carros = rede.publicar_host(&mut corrida);
+                cena.definir_carros_rede(carros, true);
+            }
+            Papel::Off => cena.definir_carros_rede(Vec::new(), true),
+        }
+        if let Some(erro) = rede.erro() {
+            if !avisou_erro_rede {
+                eprintln!("neon-drift: rede — {erro}");
+                avisou_erro_rede = true;
+            }
+        }
+        perfil.definir_rede(rede.resumo());
+        let linhas_perfil = if perfil.visivel() {
+            perfil.linhas().to_vec()
+        } else {
+            Vec::new()
+        };
+        cena.definir_perfil(linhas_perfil);
+        cena.definir_aviso_rede(Some(aviso_hud(&rede, &menu)));
+        let (linhas_menu, dica) = montar_menu(&menu, &corrida, &rede);
+        cena.definir_menu(linhas_menu, dica);
+
+        perfil.inicio_quadro();
         cena.preparar(&mut render);
         let t_cpu = Instant::now();
         render.begin_frame(&janela);
@@ -994,6 +1483,7 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         // incluí-lo transformaria toda medida em "tempo de vsync" e não diria
         // nada sobre o custo do quadro.
         ms_cpu += t_cpu.elapsed().as_secs_f64() * 1000.0;
+        perfil.fim_quadro(render.frame_counters());
         render.end_frame(&janela);
         quadros += 1;
 
@@ -1012,6 +1502,11 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
     } else {
         0.0
     };
+    // Destruição explícita **antes** do relatório: os contadores de `recursos`
+    // têm de refletir o estado final. Liberar depois daria sempre zero mesmo
+    // com recurso vazado.
+    cena.destruir(&mut render);
+
     if o.json {
         // Stdout é **só dado** neste ramo: as linhas `neon-drift:` (texturas,
         // painel, mapa, atlas) vão para stderr. Antes elas dividiam o stdout com
@@ -1023,7 +1518,7 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
             // duplicada, com o último valor vencendo em silêncio. Duas fontes do
             // mesmo número envelhecem diferente; esta é a que não tem a corrida
             // em mãos.
-            "{{\"quadros\":{quadros},\"passos\":{passos_totais},\"segundos\":{decorrido:.3},\"fps\":{fps_medio:.1},\"fps_teto\":{},\"ms_cpu\":{:.2},\"particulas\":{},\"desenhos\":{},\"efeitos\":{{{}}},\"gles\":{},\"instancing\":{},\"fase\":\"{:?}\",{}}}",
+            "{{\"quadros\":{quadros},\"passos\":{passos_totais},\"segundos\":{decorrido:.3},\"fps\":{fps_medio:.1},\"fps_teto\":{},\"ms_cpu\":{:.2},\"particulas\":{},\"desenhos\":{},\"efeitos\":{{{}}},\"gles\":{},\"instancing\":{},\"escala\":{:.2},\"lan\":\"{:?}\",\"menu\":\"{}\",\"menu_linha\":{},\"perfil\":{},\"lan_acao\":\"{}\",\"veu\":{:.2},\"batches\":{},\"recursos\":{{\"malhas\":{},\"texturas\":{},\"shaders\":{}}},\"fase\":\"{:?}\",{}}}",
             o.fps,
             if quadros > 0 { ms_cpu / quadros as f64 } else { 0.0 },
             cena.particulas_vivas(),
@@ -1031,6 +1526,23 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
             cena.efeitos_json(),
             render.gles_version().major(),
             cena.usa_instancing(),
+            menu::rotulo_escala(menu.escala()).parse::<f32>().unwrap_or(1.0),
+            rede.papel(),
+            // O menu no `--json` é o que permite provar, de um script, que o
+            // controle **navegou**: sem estes campos o estado do menu só existe
+            // na tela, e "o direcional funciona" volta a ser fé.
+            menu.linha().nome(),
+            menu.indice(),
+            menu.perfil(),
+            menu.lan().rotulo(),
+            cena.veu(),
+            cena.batches(),
+            // Contagem **depois** do `destruir`: tem de ser (0, 0, 0). Um
+            // número diferente de zero é vazamento de GPU, e é este o número
+            // que o smoke test confere.
+            render.mesh_count(),
+            render.texture_count(),
+            render.shader_count(),
             corrida.fase,
             diagnostico(&corrida, &cena, &render)
         );
@@ -1045,7 +1557,7 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
             corrida.desfecho.map(|d| d.titulo()).unwrap_or("em andamento")
         );
     }
-    render.release_all();
+    som.encerrar();
     Ok(0)
 }
 
@@ -1063,17 +1575,6 @@ fn aplicar_tecla(teclas: &mut Teclas, tecla: Keycode, apertou: bool) {
         _ => return,
     };
     *alvo = apertou;
-}
-
-/// Executa começar/reiniciar/sair. Devolve `true` quando o laço deve terminar.
-fn executar_acoes(corrida: &mut Corrida, acoes: Acoes) -> bool {
-    if acoes.comecar {
-        corrida.comecar();
-    }
-    if acoes.reiniciar {
-        corrida.reiniciar();
-    }
-    acoes.sair
 }
 
 /// Mensagem de erro de vídeo com dica do que fazer.
@@ -1207,6 +1708,39 @@ mod testes {
         assert!(t.cima && t.espaco && t.shift);
         aplicar_tecla(&mut t, Keycode::Up, false);
         assert!(!t.cima, "soltar tem de desligar");
+    }
+
+    #[test]
+    fn o_endereco_lan_aceita_ip_e_ip_com_porta() {
+        let so_ip = endereco_lan("192.168.0.9").expect("ip");
+        assert_eq!(so_ip.port(), giochi_net::PORTA_PADRAO);
+        let com_porta = endereco_lan("192.168.0.9:47900").expect("ip:porta");
+        assert_eq!(com_porta.port(), 47900);
+        assert!(endereco_lan("nao e um endereco !!!").is_err());
+    }
+
+    #[test]
+    fn o_alias_frames_faz_o_mesmo_que_quadros() {
+        // Smoke test headless usa `--frames N`; o nome antigo continua.
+        let a = opcoes(vec!["--frames".into(), "5".into()]).expect("--frames");
+        let b = opcoes(vec!["--quadros".into(), "5".into()]).expect("--quadros");
+        assert_eq!(a.quadros, Some(5));
+        assert_eq!(a.quadros, b.quadros);
+    }
+
+    #[test]
+    fn as_flags_de_lan_entram_no_estado() {
+        let o = opcoes(vec![
+            "--lan-host".into(),
+            "--lan-porta".into(),
+            "47901".into(),
+        ])
+        .expect("lan");
+        assert!(o.lan_host);
+        assert_eq!(o.lan_porta, Some(47901));
+        let c = opcoes(vec!["--lan-entrar".into(), "10.0.0.2".into()]).expect("entrar");
+        assert_eq!(c.lan_entrar.as_deref(), Some("10.0.0.2"));
+        assert!(opcoes(vec!["--lan-porta".into(), "0".into()]).is_err());
     }
 
     #[test]

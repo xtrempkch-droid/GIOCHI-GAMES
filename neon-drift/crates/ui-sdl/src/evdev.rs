@@ -10,26 +10,53 @@
 //! uma thread por dispositivo e nenhum bloqueio no laço. O custo é que o estado
 //! é global ao processo — e é por isso que `--teclas` no PC entra por outro
 //! caminho (`entrada_jogo::combinar`), em vez de fingir um evdev.
+//!
+//! ## Um bit por botão **físico**, e o significado na fusão
+//!
+//! A máscara diz "o botão A está apertado", não "o carro está acelerando". Quem
+//! traduz botão em intenção é `entrada_jogo::combinar_com_analogico`, onde as
+//! regras dão para testar sem aparelho. Duas consequências que parecem detalhe e
+//! não são:
+//!
+//! 1. **O direcional para cima não acende `ACELERAR`.** Se acendesse, soltar o
+//!    direcional apagaria o bit do A que o jogador continua segurando — e o
+//!    carro pararia de acelerar sozinho. Quem anda com o direcional usa `CIMA`,
+//!    que a fusão também lê como acelerar.
+//! 2. **O caminho do SDL (`gamepad.rs`) fala a mesma língua.** Antes, o evdev
+//!    tinha `A = acelerar` e o SDL `A = freio de mão`, e a mesma tecla fazia
+//!    coisas diferentes no aparelho e no PC.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// Acelerar (A ou direcional para cima).
+/// Botão A: acelerar com o dedo, e aceitar a linha do menu.
 pub const ACELERAR: u32 = 1 << 0;
-/// Frear / ré (B ou direcional para baixo).
+/// Botão B: frear / ré.
 pub const FREAR: u32 = 1 << 1;
-/// Virar à esquerda (direcional esquerda).
+/// Direcional para a esquerda.
 pub const ESQUERDA: u32 = 1 << 2;
-/// Virar à direita (direcional direita).
+/// Direcional para a direita.
 pub const DIREITA: u32 = 1 << 3;
-/// Freio de mão (L ou R).
+/// Freio de mão (L1 ou R1).
 pub const FREIO_MAO: u32 = 1 << 4;
 /// Nitro (L2 ou R2).
 pub const NITRO: u32 = 1 << 5;
-/// Botão de confirmar/iniciar (A, START ou X).
-pub const CONFIRMAR: u32 = 1 << 6;
-/// Botão de sair (SELECT).
-pub const SAIR: u32 = 1 << 7;
+/// Confirmar a linha do menu (o **mesmo** A que acelera).
+///
+/// É bit separado porque no menu o carro está parado e acelerar não significa
+/// nada: assim o A pode aceitar sem que a fusão precise saber em que tela está.
+pub const ACEITAR: u32 = 1 << 6;
+/// Voltar: do menu para a corrida? Não — da corrida para o **menu**, e do menu
+/// para fora do jogo. (Y ou SELECT.)
+pub const VOLTAR: u32 = 1 << 7;
+/// Jogar/reiniciar sem passar pelo cursor (START).
+pub const INICIAR: u32 = 1 << 8;
+/// Overlay de desempenho (X).
+pub const PERFIL: u32 = 1 << 9;
+/// Direcional para cima.
+pub const CIMA: u32 = 1 << 10;
+/// Direcional para baixo.
+pub const BAIXO: u32 = 1 << 11;
 
 /// Códigos evdev usados pelo jogo.
 ///
@@ -69,19 +96,27 @@ pub mod codigos {
 }
 
 /// Bit correspondente a um código evdev. `None` = botão que o jogo ignora.
+///
+/// **Um botão, um conjunto próprio de bits.** Nenhum bit é acendido por dois
+/// botões diferentes, senão soltar um apagaria o outro (ver o cabeçalho).
 pub fn bit_do_codigo(codigo: u16) -> Option<u32> {
     use codigos::*;
     Some(match codigo {
-        // Acelerar também no direcional para cima: quem joga deitado usa o
-        // direcional, e obrigar o A ali seria uma limitação sem motivo.
-        LESTE | DPAD_UP => ACELERAR,
-        SUL | DPAD_DOWN => FREAR,
+        // O A acelera **e** aceita: os dois bits nascem e morrem juntos porque
+        // são o mesmo botão.
+        LESTE => ACELERAR | ACEITAR,
+        SUL => FREAR,
+        DPAD_UP => CIMA,
+        DPAD_DOWN => BAIXO,
         DPAD_LEFT => ESQUERDA,
         DPAD_RIGHT => DIREITA,
         TL | TR => FREIO_MAO,
         TL2 | TR2 => NITRO,
-        START | NORTE => CONFIRMAR,
-        SELECT | OESTE => SAIR,
+        NORTE => PERFIL,
+        // Y e SELECT fazem o mesmo: num aparelho, o Y é onde o polegar já está
+        // e o SELECT é o que o desenho do plástico chama de "menu".
+        OESTE | SELECT => VOLTAR,
+        START => INICIAR,
         _ => return None,
     })
 }
@@ -326,14 +361,74 @@ mod testes {
     fn os_botoes_do_jogo_tem_codigo_medido_no_aparelho() {
         // Estes são os do `buttons.map` real. Trocar um deles por chute deixa o
         // botão morto, e o sintoma é "não freia" sem erro em lugar nenhum.
-        assert_eq!(bit_do_codigo(305), Some(ACELERAR), "A = BTN_EAST");
+        assert_eq!(
+            bit_do_codigo(305),
+            Some(ACELERAR | ACEITAR),
+            "A = BTN_EAST: acelera e aceita a linha do menu"
+        );
         assert_eq!(bit_do_codigo(304), Some(FREAR), "B = BTN_SOUTH");
         assert_eq!(bit_do_codigo(546), Some(ESQUERDA));
         assert_eq!(bit_do_codigo(547), Some(DIREITA));
         assert_eq!(bit_do_codigo(310), Some(FREIO_MAO), "L1");
+        assert_eq!(bit_do_codigo(311), Some(FREIO_MAO), "R1");
         assert_eq!(bit_do_codigo(313), Some(NITRO), "R2");
-        assert_eq!(bit_do_codigo(315), Some(CONFIRMAR), "START");
-        assert_eq!(bit_do_codigo(314), Some(SAIR), "SELECT");
+        assert_eq!(bit_do_codigo(307), Some(PERFIL), "X = BTN_NORTH");
+        assert_eq!(bit_do_codigo(308), Some(VOLTAR), "Y = BTN_WEST");
+        assert_eq!(bit_do_codigo(314), Some(VOLTAR), "SELECT");
+        assert_eq!(bit_do_codigo(315), Some(INICIAR), "START");
+    }
+
+    #[test]
+    fn o_direcional_nao_acende_o_bit_do_botao_de_acelerar() {
+        // Se acendesse, soltar o direcional apagaria o bit do A que o jogador
+        // continua segurando, e o carro pararia de acelerar sozinho no meio da
+        // reta. Quem anda com o direcional usa `CIMA`, que a fusão lê como
+        // acelerar.
+        let cima = bit_do_codigo(codigos::DPAD_UP).unwrap();
+        let baixo = bit_do_codigo(codigos::DPAD_DOWN).unwrap();
+        assert_eq!(cima, CIMA);
+        assert_eq!(baixo, BAIXO);
+        assert_eq!(cima & ACELERAR, 0);
+        assert_eq!(baixo & FREAR, 0);
+    }
+
+    #[test]
+    fn cada_botao_acende_conjunto_proprio() {
+        // Dois botões que compartilham um bit se apagam mutuamente ao soltar.
+        let codigos_do_jogo = [
+            codigos::LESTE,
+            codigos::SUL,
+            codigos::NORTE,
+            codigos::OESTE,
+            codigos::DPAD_UP,
+            codigos::DPAD_DOWN,
+            codigos::DPAD_LEFT,
+            codigos::DPAD_RIGHT,
+            codigos::TL,
+            codigos::TR,
+            codigos::TL2,
+            codigos::TR2,
+            codigos::START,
+            codigos::SELECT,
+        ];
+        for (i, a) in codigos_do_jogo.iter().enumerate() {
+            let ba = bit_do_codigo(*a).unwrap();
+            for b in &codigos_do_jogo[i + 1..] {
+                let bb = bit_do_codigo(*b).unwrap();
+                // As duas exceções são pares físicos que o jogo trata como um
+                // botão só (L1/R1 e L2/R2 fazem o mesmo).
+                let par = matches!(
+                    (*a, *b),
+                    (codigos::TL, codigos::TR) | (codigos::TL2, codigos::TR2)
+                        | (codigos::OESTE, codigos::SELECT)
+                );
+                if par {
+                    assert_eq!(ba, bb, "o par {:?}/{:?} devia fazer o mesmo", a, b);
+                } else {
+                    assert_eq!(ba & bb, 0, "{a} e {b} compartilham um bit");
+                }
+            }
+        }
     }
 
     #[test]

@@ -8,29 +8,63 @@ O teto é de **simulação**, não de desenho: a física roda em passo fixo de 7
 o laço só desenha o que couber. Quanto cada aparelho entrega está na tabela de
 [desempenho](#desempenho-medido-nos-três-aparelhos) — e o que sobra até 75 é do
 painel, não do jogo: no R35S, cujo display é de 60 Hz, **uma malha só** já marca
-59,7 fps, então nenhum jogo passa disso ali.
+59,7 fps, então nenhum jogo passa disso ali. No X55 a medição deu o mesmo número
+(59,7 fps com `--so asfalto`), o que fecha a conta: o aparelho entrega no máximo
+um quadro por vblank e o flip **não** se sobrepõe ao desenho.
 
 ```bash
-cargo test --workspace                        # 123 (ui-sdl) + 128 (core)
+cargo test --workspace                        # 211 (ui-sdl) + 146 (core, 2 ignorados)
 cargo build --release
+cargo clippy --workspace --all-targets        # zero erro; o jogo e o núcleo são forbid(unsafe_code)
 SDL_VIDEODRIVER=offscreen ./target/release/giochi-neon-drift --quadro /tmp/q.bmp
+SDL_VIDEODRIVER=offscreen ./target/release/giochi-neon-drift --frames 600 --json
 ./target/release/giochi-neon-drift --mapa boavista --tela corrida --passos 800 --piloto
 ```
 
+O `--frames N` é o mesmo que `--quadros N`: existe para o smoke test headless
+ler igual em qualquer jogo do repositório. Com `SDL_VIDEODRIVER=offscreen` e
+`SDL_AUDIODRIVER=dummy` ele roda sem tela e sem placa de som — é o comando que o
+CI usa.
+
+```bash
+# LAN: um host e um cliente, no mesmo PC (duas janelas ou dois offscreen)
+giochi-neon-drift --lan-host --lan-porta 47800
+giochi-neon-drift --lan-entrar 192.168.1.6:47800
+giochi-neon-drift --lan-procurar            # descobre o lobby por mDNS
+
+# aarch64 (Mali-G31/Panfrost, KMSDRM). Usa o SDL2 do sistema, não o bundled:
+export PKG_CONFIG_ALLOW_CROSS=1
+export PKG_CONFIG_LIBDIR="$HOME/.cache/giochi-arm64/pkgconfig"
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$HOME/.cache/giochi-arm64/cc-aarch64.sh"
+export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+export RUSTFLAGS="-L $HOME/.cache/giochi-arm64/devlibs -L $HOME/.cache/giochi-arm64/sysroot/usr/aarch64-linux-gnu/lib"
+cargo build --release --target aarch64-unknown-linux-gnu
+file target/aarch64-unknown-linux-gnu/release/giochi-neon-drift   # ELF aarch64, stripped
+```
+
+O `CC_aarch64_unknown_linux_gnu` não é decoração: sem ele o `cc` do host é usado
+para montar o assembly, e o link morre reclamando de arquitetura — mensagem que
+não fala de `--target`.
+
 ## Rodar no aparelho
 
-Quatro passos, e cada um responde uma pergunta diferente:
+Cinco passos, e cada um responde uma pergunta diferente:
 
 ```bash
 bash scripts/compilar-jogo-arm64.sh --jogo neon-drift        # 1. compila aarch64
 node scripts/empacotar.mjs app/jogos/neon-drift              # 2. assina o .giochi
 bash scripts/aparelho.sh instalar-pacote dist/pacotes/neon-drift.giochi  # 3. instala
-bash scripts/aparelho.sh verificar-jogo neon-drift           # 4. prova que desenha
+bash scripts/aparelho.sh catalogo                            # 4. publica o cartão
+bash scripts/aparelho.sh verificar                           # 5. prova que o painel desenha
 ```
 
-1. **Compila** e deixa em `bin/giochi-neon-drift` (656 216 bytes, `NEEDED` = SDL2 +
-   `libgcc_s` + `libm` + `libc`). O script pergunta ao aparelho se ele tem
-   `SDL2_ttf`, mas este jogo **não usa** — o texto é a fonte 5×7 em dados.
+1. **Compila** e deixa em `bin/giochi-neon-drift` (1 296 560 bytes, `NEEDED` =
+   SDL2 + `SDL2_image` + `libgcc_s` + `libm` + `libc`). O script pergunta ao
+   aparelho se ele tem `SDL2_ttf`, mas este jogo **não usa** — o texto é a fonte
+   5×7 em dados. O tamanho quase dobrou na modernização: `laminar` + `mdns-sd`
+   (descoberta de lobby) e as cópias embutidas dos dois `.obj`. Se o pacote
+   apertar, a ordem de corte é: `mdns` (o cliente ainda entra por
+   `--lan-entrar`), depois os modelos embutidos.
 2. **Assina** (Ed25519) e recusa pacote sem `.sig` ou com `.sig` de tamanho
    errado. O empacotamento é reprodutível: dois do mesmo conteúdo dão o mesmo
    SHA-256.
@@ -39,13 +73,70 @@ bash scripts/aparelho.sh verificar-jogo neon-drift           # 4. prova que dese
    permite vender app GPL sem entregar chave. O `aparelho.sh` verifica a
    assinatura com a **chave do próprio aparelho**, não com uma do PC: verificar
    contra a chave errada produz um veredito, e veredito errado é pior que nenhum.
-4. **Verifica** rodando com `--quadro`, trazendo o BMP e contando cores, preto
-   puro e tamanho. "O processo subiu" e "desenhou" são afirmações diferentes, e
-   só a segunda interessa.
+4. **Publica o cartão** (`catalogo`), senão o jogo fica **invisível sem erro**: o
+   launcher lê `/opt/giochi/apps/index.json`, e um app instalado fora dele não
+   vira cartão.
+5. **Verifica** o *launcher*: ele precisa estar rodando e com o DRM aberto, e o
+   `verificar` ainda captura um quadro dele e compara com a referência desenhada
+   no PC. "O processo subiu" e "desenhou" são afirmações diferentes, e só a
+   segunda interessa. Isso prova o painel, **não** o jogo — para o jogo, veja a
+   captura logo abaixo.
 
-`aparelho.sh catalogo` republica o índice depois da instalação, senão o jogo fica
-**invisível sem erro**: o launcher lê `/opt/giochi/apps/index.json`, e um app
-instalado fora dele não vira cartão.
+#### Provar que o **jogo** desenha no aparelho
+
+O KMSDRM é exclusivo: com o launcher rodando, um segundo processo recebe
+`kmsdrm not available` e não gera BMP nenhum. A sequência é parar, capturar e
+subir de novo — e a flag `/run/giochi/dev-free-console` é o que impede o
+supervisor de ressuscitar o launcher no meio da captura:
+
+```bash
+ssh root@$APARELHO 'touch /run/giochi/dev-free-console
+  kill $(pgrep -x giochi-launcher); sleep 2
+  /user/apps/neon-drift/bin/giochi-neon-drift --quadro /tmp/jogo.bmp --passos 1200 --piloto
+  echo "exit=$?"'
+scp root@$APARELHO:/tmp/jogo.bmp .
+bash scripts/aparelho.sh subir        # devolve o aparelho ao normal
+```
+
+Duas armadilhas, as duas custaram uma rodada perdida no X55:
+
+- **não passe `--tamanho`** nessa captura. O KMSDRM ignora o pedido e usa o modo
+  do painel (720×1280), mas a rotação que o jogo deduz sai do tamanho **pedido** —
+  e o BMP sai inconsistente (a primeira captura do X55 deu 33 % de tela preta e
+  foi descartada por isso; a segunda, sem `--tamanho`, deu 5,6 %).
+- Esqueça a flag ligada e o supervisor fica sem subir o launcher: `aparelho.sh
+  subir` é o passo que fecha o ciclo, não um extra opcional.
+
+#### A instalação no X55, do jeito que foi feita
+
+Feita em `10.55.0.2` (`giochi-system-x55`, SSH por `usb0`, chave já autorizada):
+
+```bash
+md5sum bin/giochi-neon-drift                     # 61c2d1e8db78314a814c186e01c347d7
+node scripts/empacotar.mjs app/jogos/neon-drift  # 1 306 624 bytes
+bash scripts/aparelho.sh instalar-pacote dist/pacotes/neon-drift.giochi
+bash scripts/aparelho.sh catalogo
+```
+
+A assinatura saiu com a chave da **imagem** (`~/.cache/giochi-system/chaves-loja/
+loja-privada.pem`) — sem o aviso "chave NÃO é a da imagem", que é o que faria o
+aparelho recusar o pacote. O binário instalado em `/user/apps/neon-drift/bin/`
+tem o mesmo md5 do `bin/` do repositório: o que roda no aparelho é o que foi
+medido aqui.
+
+Nos dois `.obj`, o aparelho **não precisa** dos arquivos: sem `assets/modelos` ao
+lado do executável, o `modelos.rs` grava a cópia embutida em
+`/tmp/giochi-neon-drift-modelos/` e carrega pelo mesmo `render.load_obj_mesh`.
+Conferido no `--json` do X55: os dois carregaram do `include_str!`.
+
+O que o aparelho reportou nas execuções instaladas: GLES 3 (`instancing: true`),
+**20 batches** do `StaticBatch`, 88 postes / 6 cones / 4 portais desenhados por
+`draw_instanced`, 9 texturas procedurais mais as **2 máscaras de luz**, de 56 a
+60 desenhos e de 168 mil a 252 mil vértices conforme o mapa — e sempre
+`recursos: {malhas:0, texturas:0, shaders:0}`. O `destruir()` não deixou nada
+para trás nem no aparelho — as máscaras entram na mesma conta, e um
+`destroy_texture` esquecido nelas apareceria aqui como `texturas: 2`. O fps
+daí está na [tabela de desempenho](#desempenho-medido-nos-três-aparelhos).
 
 ### O que o aparelho precisa ter
 
@@ -66,8 +157,54 @@ no X35H e no R35S sem uma linha de código por aparelho.
 | Aparelho | Painel | fps | O que limita |
 | --- | --- | --- | --- |
 | X35H (RK3566, Mali-G52) | 640×480 | **36,6 a 37,1 nos cinco mapas** | o conjunto: o `cobrinha` mede 49,3 no mesmo instante e `--so asfalto` 49,2 |
-| X55 (RK3566, painel 720×1280) | 720×1280 | **39,5** | pixel: o dobro de área do X35H, e o piso de apresentação é 16,7 ms |
+| X55 (RK3566, painel 720×1280) | 720×1280 | **36,6 a 37,8** depois da modernização (39,5 antes) | `1,04 ms + 0,154 ms por desenho + 16,7 ms de flip`, em série — ver abaixo |
 | R35S (RK3326, Mali-G31) | 640×480 | **não medido** | — (a rodada de 09/11 só mediu quadro e HUD) |
+
+Medido no X55 já instalado, `--frames 600`, `--sem-vsync`, launcher parado:
+
+| Mapa | fps | ms de CPU | desenhos | vértices |
+| --- | --- | --- | --- | --- |
+| avenida | 36,9 | 10,30 | 57 | 167 796 |
+| circuito | 37,8 | 9,79 | 60 | 251 568 |
+| salar | 36,6 | 10,61 | 60 | 203 524 |
+
+A conta fecha com o `ms_cpu` das três linhas, e é ela que explica o teto:
+`1/(0,0103 s + 0,0167 s) = 37,0` contra 36,9 medidos; `1/(0,0098 + 0,0167) = 37,8`
+contra 37,8; `1/(0,0106 + 0,0167) = 36,6` contra 36,6. Ou seja, o quadro é **CPU
+seguida do flip**, em série: o `eglSwapBuffers` do KMSDRM bloqueia até o
+page-flip do quadro anterior terminar no vblank, e esse tempo não é usado para
+adiantar o próximo quadro. Cortar vértices (avenida 168 mil → circuito 252 mil,
+um aumento de 50 %) não muda o fps, o que confirma que a GPU não é o limite.
+
+O `--so`, que desenha um recorte, localiza o custo dentro do quadro:
+
+| Recorte | fps | ms de CPU | desenhos | vértices |
+| --- | --- | --- | --- | --- |
+| `--so asfalto` (uma malha, quatro vértices) | **59,6** | 1,19 | 1 | 4 |
+| `--so mundo` (só a geometria estática) | 41,3 | 5,97 | 32 | 158 968 |
+| cena completa | 36,9 | 10,30 | 57 | 167 796 |
+
+Duas conclusões, e as duas mudam o que fazer:
+
+1. **O teto do aparelho é ~60 fps e não sobra folga nele.** Com uma malha só o
+   X55 marca 59,6 fps — ou seja, 16,8 ms por quadro, exatamente um vblank, mesmo
+   com `--sem-vsync` (o backend KMSDRM do SDL2 espera o page-flip de qualquer
+   jeito). A partir daí o custo da cena não é absorvido pelo tempo do vblank: ele
+   é **somado**, porque o flip só é pedido depois que o desenho termina e o
+   processo então espera o próximo vblank inteiro. 60 fps "estáveis" com cena,
+   nesse backend, exigiria apresentação assíncrona (dois swap chains ou page-flip
+   `NONBLOCK`), que é mudança de engine, não de jogo.
+2. **O custo escala com o número de desenhos, não com o de vértices.** Ajustando
+   as duas primeiras linhas, `ms_cpu ≈ 1,04 + 0,154 ms × desenho`: com 32 desenhos
+   prevê 5,97 (medido 5,97), e com 57 prevê 9,81. A cena completa mede **10,30** —
+   os 0,5 ms de diferença são a amostragem das duas máscaras de luz, que os
+   recortes `--so` não desenham (eles cortam os carros inteiros). São 159 mil
+   vértices entre a primeira e a segunda linha e o custo acompanha os 31
+   desenhos, não os vértices: cada `draw` custa ~154 µs no Cortex-A55 com
+   Panfrost, e é por isso que o `StaticBatch` e o `draw_instanced` valem o que
+   valem. O número não é particularidade de uma unidade: os 51 a 53 desenhos
+   medidos no X35H na tabela abaixo dão ~8,9 ms, contra 9,45 a 9,96 medidos, no
+   mesmo SoC com uma GPU diferente.
 
 Medido no X35H em 10/11/2026, `--quadros 600`, sem o launcher segurando o DRM:
 
@@ -275,17 +412,34 @@ na **vertical** no título (`←`/`→` continuam sendo o mapa).
 
 ## Texturas
 
-Sete materiais, todos **gerados em código** (`crates/ui-sdl/src/texturas.rs`):
-asfalto, concreto, rocha, mata, guarda-corpo, painel de neon e o xadrez da
-largada. Nenhum arquivo de imagem.
+Nove materiais, todos **gerados em código** (`crates/ui-sdl/src/texturas.rs`):
+asfalto, concreto, rocha, mata, guarda-corpo, painel de neon, o xadrez da
+largada e, desde a modernização, **faixa-pista** (tracejado e duas linhas) e
+**grade-neon** (grade ortogonal das fitas de barreira). Nenhum arquivo de
+imagem é obrigatório.
+
+### Power-of-two, mipmap e `GL_REPEAT`
+
+Todas são **64×64**, e isso não é escolha de resolução: o GLES 2.0 só aceita
+`GL_REPEAT` e `glGenerateMipmap` em texturas cujo lado é potência de dois
+(`texture.rs` da engine checa `is_power_of_two()` e cai para `CLAMP_TO_EDGE`
+sem mipmap quando não é). Um lado de 100 px daria emenda visível e *aliasing*
+a 30 m, sem erro de GL. O atlas de sprites é 128×128 pelo mesmo motivo — e o
+único material que sai **sem** mipmap é o atlas, de propósito: nele cada célula
+é vizinha de outra, e o filtro trilinear puxa o texel do vizinho.
+
+As duas texturas novas são **decalques**: o fundo é o asfalto, e o que desenha
+são as linhas. O teste de luminância trata as duas por uma regra própria (fração
+de pixels claros > 5%) em vez da média > 90 dos materiais de superfície —
+medir média nelas reprovaria uma textura correta.
 
 Gerar em vez de carregar PNG não é preferência estética, é reduzir superfície de
 falha. A primeira motivação era medida: na imagem de 07/11 do R35S o
 `libSDL2_image` foi compilado sem `--enable-png` e `IMG_Load` respondia *"PNG
-images are not supported"*. **A imagem de 09/11 corrigiu isso** (`libpng16`
-presente, a mensagem não existe mais), mas o jogo mantém a decisão por um motivo
-que não depende de imagem nenhuma: **ele não linka `SDL2_image`**. O `NEEDED` do
-binário é SDL2 + `libgcc_s` + `libm` + `libc`, e nada mais.
+images are not supported"*. **A imagem de 09/11 corrigiu isso**, e a sincronização
+com a engine 0.4.0 passou a usar o `Texture3D::from_file` — o binário ganhou
+`libSDL2_image-2.0.so.0` no `NEEDED`. O que continua valendo é a **queda**: sem
+arquivo externo, a textura sai da fórmula, e nenhuma das nove é obrigatória.
 
 Os outros motivos, que também não mudaram: uma textura é uma fórmula (asfalto é
 ruído com pedrisco, concreto são blocos com junta, mata é ruído em duas escalas
@@ -537,28 +691,300 @@ seria o próximo número mágico a dar errado.
 | Adversários | três, com linha própria e freando na curva; ~9 s atrás de um piloto competente em duas voltas |
 | Câmera | terceira pessoa com atraso exponencial, inclinação na derrapagem, tremor na batida e **FOV que abre no nitro** |
 | HUD | volta, posição, tempo, velocímetro, marcha, barra de nitro, pontos e combo de drift |
-| Efeitos | **7 tipos de partícula**, cada um com a sua forma no atlas de sprites (fumaça, respingo, faísca, nitro, chuva, poeira de neon, marca de pneu), raios de velocidade, clarão de nitro, aura de neon sob os carros, feixe de farol no asfalto e **áudio sintetizado em runtime** (motor, derrapagem contínua e nitro) |
+| Efeitos | **7 tipos de partícula**, cada um com a sua forma no atlas de sprites (fumaça, respingo, faísca, nitro, chuva, poeira de neon, marca de pneu), raios de velocidade, clarão de nitro, **poça de neon com máscara de alfa** sob cada carro e **cone de farol** no asfalto — os dois acendem no drift — e **áudio sintetizado em runtime** (motor, derrapagem contínua e nitro) |
 | Cenário | avenida: cidade noturna com **arcos de neon a cada 26 m**, três passarelas, outdoors luminosos, refletores na mureta, faixas de neon nas torres distantes e **pulos de luz em duas fases** no túnel |
-| Telas | título com instruções, corrida e resultado com "reiniciar" |
+| Telas | **menu do título** (mapa, dificuldade, qualidade, perfil, LAN e jogar, tudo no direcional) , corrida e resultado com "reiniciar" e "voltar ao menu" |
 
 Nada aqui usa marca, carro ou logo real: os carros são caixas com proporções de
 carro e o cenário é aritmética.
 
-## Controles
+## O véu das telas de texto
+
+O título e o resultado desenham texto claro **sobre a cidade**, e o céu da serra
+chega a 39 de luminância média: um texto de 5×7 de 2 px por ponto sobre esse
+fundo não se lê num painel de 3,5" sob luz do dia. Relatado pelo dono como
+*"o texto da tela de entrada fica muito difícil de visualizar"*.
+
+A correção é um quad preto translúcido de tela cheia entre o mundo e o texto —
+o cenário continua girando atrás do menu (é o que dá vida à tela de entrada),
+mas deixa de competir com as letras, e **na corrida o véu é zero**: o jogo
+volta ao brilho normal.
+
+| Fase | Alvo do véu |
+| --- | --- |
+| título | **0,62** |
+| resultado | 0,50 |
+| corrida | 0,00 |
+
+O valor do título não é estética: 0,62 é o que leva o fundo local a 11 de
+luminância com o texto em 184–189 — 12:1 de contraste, medido no PC e no painel
+do X55.
+
+### A transição: rampa com limite, não suavização exponencial
+
+Suavização exponencial foi a primeira tentativa e falhou nas duas exigências ao
+mesmo tempo: com τ = 0,12 s o véu pulava 26 % no primeiro quadro (pisca), e com
+τ grande levava 0,7 s para sumir na largada (atrasa). O que ficou é uma rampa
+com passo limitado:
+
+```
+passo = (alvo − atual).clamp(−dt/0,30, +dt/0,30)
+```
+
+São 0,044 por quadro a 75 Hz e a transição termina em 14 quadros: não pisca
+porque o passo tem teto, não atrasa porque o teto é alto. `GIOCHI_VEU=0` desliga
+o véu inteiro — é o A/B que mede o contraste.
+
+### Medido: contraste 5,55:1 → 12,12:1
+
+Os dois lados do A/B com o mesmo número de quadros — 1024×768 no PC e o painel
+real do X55 (720×1280, girado). O texto é o mesmo pixel a pixel (ele é desenhado
+**depois** do véu, então não escurece); o que muda é o fundo em volta:
+
+| Medida | PC sem | PC com | X55 sem | X55 com |
+| --- | --- | --- | --- | --- |
+| luminância do texto (média) | 189,1 | 189,0 | 184,2 | **184,0** |
+| fundo local (mediana) | 30 | 11 | 31 | **11** |
+| contraste texto/fundo | 5,55:1 | **12,12:1** | 5,26:1 | **11,81:1** |
+
+A cobertura é conferida em seis faixas horizontais de 128 px: todas escurecem
+na mesma proporção (~0,40), inclusive as duas das pontas e os quatro cantos.
+Esse teste é o que pegou o defeito abaixo.
+
+### O que custa
+
+Um quad de tela cheia com mistura alfa, e **só nas telas de texto** — na corrida
+o desenho nem é emitido (`veu > 0,002` é falso):
+
+| No X55 (painel 720×1280) | Sem véu | Com véu |
+| --- | --- | --- |
+| fps na tela de título | 36,2 | **29,8** |
+| `ms_cpu` na tela de título | 10,20 | 12,08 |
+| fps na corrida | 37 | **37** (inalterado) |
+| chamadas de desenho na corrida | 57 | **57** (inalterado) |
+
+São 6,4 fps a menos numa tela **estática**, onde fluidez não vale nada, para
+trocar 5,26:1 de contraste por 11,81:1 — e a corrida, que é onde o quadro tem de
+correr, não paga nada. Se algum dia o menu precisar de mais fôlego num aparelho
+mais fraco, o caminho é baixar a escala de render **só na fase de título**, não
+engrossar o véu.
+
+### O defeito que a captura pegou: `hud_matriz` cobre um quarto da tela
+
+A primeira versão desenhava o véu com `retangulo(0, 0, largura, altura)`, e um
+retângulo de "tela cheia" por essa matriz cobria **512×384 de 1024×768** — o
+quarto central, com as bordas intactas. A razão está no mapeamento: `hud_matriz`
+acerta o **centro** de qualquer elemento no pixel pedido, mas o **tamanho** sai
+pela metade, porque o NDC vai de −1 a +1 (duas unidades) e a escala dela entrega
+uma. Todo o texto do HUD é calibrado nesse espaço — dobrá-lo faria as linhas se
+sobreporem — então a matriz não se mexe; quem precisa dos cantos exatos da tela
+usa `hud_matriz_tela`, que escala o quad unitário por `2·PROF·aspecto` na
+largura e `2·PROF` na altura.
+
+O mesmo erro existia no **flash de nitro**, desde sempre: ele também cobria só o
+quarto central, e ninguém viu porque o alfa é 0,05. Corrigido junto.
+
+E o teste que deveria ter pego isso mentia:
+
+```rust
+// errado: multiplica por 2 no lugar de dividir, e "prova" a cobertura
+let largura_ndc = (m.data[0] / (PROFUNDIDADE_HUD * aspecto)) * 2.0;
+```
+
+Ele passou por anos afirmando 2,0 de NDC para um quad que entrega 1,0. O
+substituto (`a_hud_matriz_dimensiona_pela_metade_do_pixel`) afirma o valor real,
+e `a_matriz_de_tela_cheia_encosta_nos_quatro_cantos_do_ndc` projeta os cantos
+pela `view_projection` da câmera do HUD de verdade e exige ±1 nos dois eixos —
+em tela normal e com o painel girado 90° e 270°, onde a proporção vem do
+**painel** e não do projeto.
+
+## Controles: o controle é o caminho, o teclado é o atalho
+
+O jogo é de handheld, então **tudo** se faz com o controle. O teclado continua
+funcionando no PC, com as mesmas ações, mas não é o caminho principal — e até a
+revisão de controles ele era o **único** para quatro coisas: LAN, escala de
+render, overlay de desempenho e as opções do menu. Num aparelho sem teclado elas
+eram inalcançáveis justamente onde mais importam.
+
+### No aparelho (e em qualquer controle)
+
+| Botão | Na corrida | No menu (título) |
+| --- | --- | --- |
+| A / gatilho direito | acelerar | **aceitar** a linha |
+| B / gatilho esquerdo | frear / ré | — |
+| analógico / direcional | virar, acelerar (↑) e frear (↓) | **↑↓** move o cursor |
+| direcional ← / → | virar | **muda o valor** da linha |
+| L1 / R1 | freio de mão (**é o que liga o drift**) | — |
+| L2 / R2 | nitro | — |
+| **START** | — | jogar / reiniciar sem passar pelo cursor |
+| **X** | overlay de desempenho | overlay de desempenho |
+| **Y** / SELECT | **volta ao menu** | sai do jogo |
+
+`Y` na corrida volta ao menu, e não mata o jogo: no aparelho o polegar escorrega,
+e o botão que fecha tudo tem de ser o do menu.
+
+### O menu do título
+
+```
+> MAPA         [ AVENIDA CENTRAL ]
+  DIFICULDADE  [ NORMAL ]
+  QUALIDADE    [ 1.00 ]
+  PERFIL       [ DESLIGADO ]
+  LAN          [ DESLIGADA ]
+  JOGAR
+ESQ/DIR TROCA O MAPA
+```
+
+Seis linhas, um cursor e dois botões: ↑↓ escolhe a linha, ←→ muda o valor, A
+aceita. A linha **LAN** cicla `DESLIGADA → HOSPEDAR → ENTRAR POR MDNS` e o A
+executa — com a LAN no ar ela passa a mostrar o estado (`HOST 10.55.0.1:47800
+(1)`), e o A desliga. A linha **QUALIDADE** é o `F3` com nome: `1.00 → 0.75 →
+0.50`, e satura nas pontas.
+
+A **dificuldade** explica a si mesma na linha de baixo ("adversários 12% mais
+lentos"), porque "desafiante" sem explicação faz o jogador sentir o carro lento
+e chamar de bug.
+
+### Teclado (PC)
 
 | Tecla | Ação |
 | --- | --- |
 | `W`/`↑` | acelerar |
 | `S`/`↓` | frear (e ré, parado) |
-| `A`/`D` ou `←`/`→` | virar |
+| `A`/`D` ou `←`/`→` | virar (e navegar o menu) |
 | `Espaço` | freio de mão — **é o que liga o drift** |
 | `Shift` | nitro |
 | `Enter` | jogar / reiniciar |
-| `Esc` | sair |
+| `Esc` | voltar ao menu / sair |
+| `F1` | overlay de desempenho (fps, ms, draw calls, rede) |
+| `F3` | escala de render: 1,00 → **0,75** → 0,50 → 1,00 |
+| `-` / `=` | muda o valor da linha do cursor no menu |
+| `H` (menu) | hospedar corrida LAN + anunciar por mDNS |
+| `J` (menu) | procurar lobby na LAN e entrar |
 
-No controle do aparelho os mesmos comandos chegam por evdev, pelo `buttons.map`
-do sistema: A acelera, B freia, direcional vira, L1 é o freio de mão, R2 é o
-nitro e START confirma.
+### Gamepad pelo SDL, com analógico e gatilhos
+
+O evdev lê o controle cru do aparelho — é o caminho de produção no R35S, onde o
+mapeamento do sistema já está certo. O `gamepad.rs` cobre o resto (PC, controle
+USB genérico, SDL atualizado): abre o primeiro `GameController`, lê **estado** a
+cada quadro (não evento — corrida precisa de "quanto", e um evento entre dois
+passos do timestep fixo se perderia) e entrega:
+
+| Entrada | Vai para |
+| --- | --- |
+| gatilho direito (`TriggerRight`) | `acelerar`, proporcional `0..1` |
+| gatilho esquerdo (`TriggerLeft`) | `frear`, proporcional `0..1` |
+| analógico esquerdo (`LeftX`) | `virar`, com zona morta de 0,16 **reescalada** |
+| D-Pad | `CIMA`/`BAIXO`/`ESQUERDA`/`DIREITA` — os mesmos bits do evdev |
+| A, B, X, Y | `ACELERAR`+`ACEITAR`, `FREAR`, `PERFIL`, `VOLTAR` |
+| L1 / R1 / START / SELECT | freio de mão / nitro / `INICIAR` / `VOLTAR` |
+
+**A mesma tecla faz a mesma coisa nos dois caminhos.** Até a revisão de
+controles, o evdev tinha `A = acelerar` e o SDL `A = freio de mão`: o mesmo
+botão, dois significados, conforme quem abrisse o controle. Hoje os dois falam
+o vocabulário de **botão físico** (`evdev::bit_do_codigo`) e quem traduz botão
+em intenção é `entrada_jogo::combinar_com_analogico`, onde as regras dão para
+testar sem aparelho.
+
+O direcional acende `CIMA`/`BAIXO`, e **não** `ACELERAR`/`FREAR`: se acendesse,
+soltar o direcional apagaria o bit do A que o jogador continua segurando e o
+carro pararia de acelerar sozinho na reta. A fusão lê `CIMA` como acelerar, e
+há teste para isso.
+
+Teclado, bits e analógico **somam com `max`** em cada canal, e o resultado é
+limitado a 1: apertar acelerar na seta e no gatilho não dá o dobro de
+aceleração. A fusão é função pura (`entrada_jogo::combinar_com_analogico`) e os
+testes dela rodam sem controle plugado.
+
+A zona morta **reescala** o resto do curso: sem isso o primeiro milímetro depois
+dela salta de 0 para 0,16 e a correção fina de drift fica quadrada.
+
+### Escala de render: o botão do fill-rate
+
+Num painel de 720×1280 são 921 mil pixels por quadro, e um Mali gasta
+proporcionalmente ao **pixel**, não ao triângulo. `F3` chama
+`render.set_render_scale(Some(0.75))` — desenha em 540×960 e estica com
+bilinear — e `0,50` para o caso extremo. O primeiro toque cai em **0,75** de
+propósito: é o degrau que ainda deixa o HUD legível. O `--json` publica
+`"escala"` e o overlay F1 mostra a mesma coisa, para o número da tela não mentir
+sobre o que foi desenhado de verdade.
+
+**Não espere ganho no X55.** Medido lá, com o jogo instalado: 1,00 → 36,9 fps,
+0,75 → 36,9, 0,50 → 35,8. O motivo está na seção de desempenho acima: no X55 o
+tempo de quadro é `1,04 ms + 0,154 ms por desenho + 16,7 ms de flip`, e nenhuma
+dessas três parcelas depende de quantos pixels a cena ocupa — o `StaticBatch`
+continua desenhando os mesmos 20 batches e a mesma contagem de desenhos. Num
+aparelho em que o fragmento domine, o botão continua valendo; num aparelho
+limitado pelo flip, o que valeria é apresentar um quadro enquanto o outro está no
+scanner, e isso é o pipeline de apresentação da engine, não o jogo. O `F3` fica
+porque é barato e honesto: se um dia o aparelho passar a ser limitado por pixel,
+o botão já está lá — e enquanto não passar, o número medido diz que ele não ajuda.
+
+## Revisão de controles: o teclado deixou de ser necessário
+
+O jogo é de handheld, e por três versões quatro coisas **só** existiam no
+teclado: LAN (`H`/`J`), escala de render (`F3`, `-`/`=`), overlay (`F1`) e as
+opções do título (mapa e dificuldade nas setas). Num aparelho isso é o mesmo que
+não existir — e é justamente onde a escala importa (fill-rate de Mali-G31) e
+onde a LAN é o modo de jogar com outra pessoa.
+
+A revisão fez quatro coisas:
+
+1. **Menu do título** (`menu.rs`, puro e testável): seis linhas, cursor, dois
+   botões. Mapa, dificuldade, qualidade, perfil, LAN e jogar.
+2. **Botão para cada função**: `X` = overlay, `START` = jogar/reiniciar,
+   `Y`/SELECT = voltar, `A` = aceitar.
+3. **`Y` na corrida voltou a significar "menu"**, não "matar o processo". Antes,
+   um dedo escorregado no botão ao lado do B fechava o jogo — e sem uma tecla
+   `Esc` não havia como chegar ao menu para trocar a escala.
+4. **O caminho do controle e o do evdev agora falam a mesma língua.**
+
+### Os três defeitos que a revisão achou
+
+- **`A` queria dizer duas coisas.** No evdev, `A` acendia `ACELERAR`; no SDL,
+  `FREIO_MAO`. O mesmo botão, dois significados, conforme quem abrisse o
+  controle — e nenhum teste pegava, porque cada caminho era testado sozinho.
+  Hoje a máscara descreve o **botão físico** e quem traduz botão em intenção é a
+  fusão, com teste.
+- **O direcional acendia `ACELERAR`.** Parece inofensivo até o jogador segurar o
+  `A`, tocar o direcional e soltar: o `fetch_and(!bit)` do evdev apagava
+  `ACELERAR` e o carro parava de acelerar sozinho no meio da reta. O direcional
+  acende `CIMA`/`BAIXO`, que a fusão também lê como acelerar/frear — e há teste
+  para a sequência inteira (`segurar_o_direcional_nao_apaga_o_acelerar_do_a`).
+- **Acento virava buraco.** A dica de dificuldade é "adversários 12% mais
+  lentos"; a fonte 5×7 é ASCII maiúscula, e o `á` sem glifo avançava o cursor e
+  desaparecia. O jogador lia **"RITMO DE FBRICA"**. A cena agora normaliza todo
+  texto com `fonte::para_ascii` antes de desenhar, e a conversão é **1:1 em
+  caracteres**, então a medida que o chamador fez com `largura_texto` continua
+  valendo (texto descentralizado seria o próximo defeito).
+
+### Como se prova que o controle faz tudo, sem controle
+
+O laço transforma nível em **borda** (segurar não repete a ação), então `--teclas
+down` move o cursor uma linha só. Para simular **toques**, dois pares de flags
+com um `;` por toque:
+
+```bash
+B=./target/release/giochi-neon-drift
+
+# o direcional do controle navega o menu
+$B --frames 12 --botoes-ciclo "baixo;baixo" --json | jq -r .menu      # qualidade
+
+# A na linha PERFIL liga o overlay; A em JOGAR começa a corrida
+$B --frames 12 --botoes-ciclo "baixo;baixo;baixo;a" --json | jq -r .perfil   # true
+$B --frames 12 --botoes-ciclo "cima;a" --json | jq -r .fase                  # Correndo
+
+# a LAN: escolher HOSPEDAR com o direcional e executar com A
+$B --frames 14 --botoes-ciclo "baixo;baixo;baixo;baixo;dir;a" --json | jq -r .lan  # Host
+
+# X na corrida, Y de volta ao menu
+$B --frames 14 --botoes-ciclo "start;x" --json | jq -r .perfil   # true
+$B --frames 14 --botoes-ciclo "start;y" --json | jq -r .fase     # Titulo
+```
+
+O `--json` publica `menu` (a linha do cursor), `menu_linha`, `perfil`, `lan` e
+`lan_acao`: sem esses campos o estado do menu só existiria na tela, e "o
+direcional funciona" voltaria a ser fé.
 
 ## Como o teto de 75 fps é garantido
 
@@ -568,12 +994,38 @@ desenha o que couber. Um aparelho que desenhe mais rápido que 75 Hz espera; um
 que desenhe mais devagar perde quadros de desenho, **nunca de simulação**. A CLI
 recusa `--fps-teto` fora de 1..75.
 
+### O orçamento medido depois da modernização
+
+`--frames 1200` em `--release`, offscreen, cinco pistas, com piloto e partículas
+vivas: **75,0 fps em todas** (teto do relógio) e **0,37–0,44 ms de CPU por
+quadro**. Contra os 16,7 ms de um quadro a 60 Hz, sobra ~97% do orçamento de
+CPU. O número que importa para 60 FPS estáveis é esse, não o fps: com o teto em
+75 o fps só diria "chegou no teto". No aparelho a conversa é outra — lá o mesmo
+jogo gasta 9,8 a 10,6 ms de CPU e o flip cobra 16,7 ms sem sobrepor, o que dá os
+~37 fps da [tabela de desempenho](#desempenho-medido-nos-três-aparelhos).
+
+| Pista | fps (teto) | ms_cpu | draw calls |
+| --- | --- | --- | --- |
+| avenida | 75,0 | 0,40 | 57 |
+| boavista | 75,0 | 0,40 | 56 |
+| circuito | 75,0 | 0,43 | 57 |
+| porto | 75,0 | 0,44 | 56 |
+| salar | 75,0 | 0,37 | 56 |
+
+O custo no **aparelho** é outro eixo, e não é nem o pixel nem o vértice: medido
+no X55, 50 % mais vértices (avenida 168 mil → circuito 252 mil) e o desenho em
+360×640 em vez de 720×1280 deram o mesmo fps (35,8 a 37,8 nos quatro casos). O que
+manda lá é `ms_cpu + 16,7 ms de flip`, em série, e o `ms_cpu` anda com o número de
+desenhos — a conta está na seção de desempenho dos aparelhos. O `F3` continua
+existindo porque é o único botão que muda o custo por pixel, e num aparelho
+limitado por fragmento é ele que libera; no X55 ele não tem o que liberar.
+
 ## Diagnóstico sem dedo no aparelho
 
 | Comando | Para quê |
 | --- | --- |
 | `--quadro q.bmp` | desenha um quadro e sai (offscreen no PC) |
-| `--tamanho 640x480` | painel simulado |
+| `--tamanho 640x480` | painel simulado **no PC**; no aparelho o KMSDRM ignora o pedido e usa o modo do painel, o que produz BMP inconsistente — capture no aparelho **sem** o `--tamanho` |
 | `--passos 1500` | adianta a simulação |
 | `--piloto` | o piloto artificial dirige durante os `--passos` |
 | `--tela corrida` | força uma tela |
@@ -582,25 +1034,48 @@ recusa `--fps-teto` fora de 1..75.
 | `--em 1240` | posiciona o carro em `s = 1240 m` já a 48 m/s — é como se cai **em cima** de uma rampa sem dirigir até ela |
 | `--so asfalto_t` | desenha **uma** malha só (nome da malha; `GIOCHI_SEM` usa o nome da textura) |
 | `--so mundo` | desenha toda a geometria estática e mais nada |
-| `--teclas w,a,space` | teclas seguradas |
-| `--quadros N` | desenha N quadros e sai (mede fps quando há relógio) |
+| `--teclas a,right,shift` | teclas **seguradas** |
+| `--teclas-ciclo "down;down;a"` | toques de tecla: um `;` = um toque (aperta e solta) |
+| `--botoes a,start` | botões de **controle** segurados (`a,b,x,y,l1,r1,l2,r2,start,select,cima,baixo,esq,dir`) |
+| `--botoes-ciclo "baixo;baixo;esq"` | toques de botão: é como se prova, por script, que o controle navega o menu |
+| `--quadros N` / `--frames N` | desenha N quadros e sai (mede fps quando há relógio). `--frames` é o nome que o smoke test headless do repositório usa |
 | `--fps-teto 75` | baixa o limite de quadros (1 a 75; 75 é o padrão e o máximo) |
 | `--sem-som` | não abre o dispositivo de áudio |
 | `--sem-vsync` | pede troca de buffer sem espera (`GIOCHI_VSYNC=0`). No KMSDRM do aparelho **não tem efeito**: o `drmModePageFlip` continua esperando o campo, e é por isso que se mede comparando configurações, não buscando o "custo puro" |
 | `--escala 0.75` | desenha em resolução menor e estica (Upscaler da engine; `GIOCHI_ESCALA`) |
 | `--atlas a.bmp` | grava o atlas de sprites e sai, **sem abrir janela** |
-| `--texturas t.bmp` | grava as 7 texturas lado a lado, **sem abrir janela** — o molde para pintar |
+| `--texturas t.bmp` | grava as 9 texturas lado a lado, **sem abrir janela** — o molde para pintar |
+| `--lan-host` / `--lan-entrar IP[:porta]` | sobe/entra numa corrida LAN; `--lan-procurar` descobre o lobby por mDNS e `--lan-porta` troca a porta (controle = porta + 1) |
 | `--prova-rotacao b.bmp` | três barras de cor conhecida em coordenadas de projeto, com posição prevista em número. Separa "o mundo girou errado" de "o HUD girou errado" sem olhar a tela |
-| `--json` | estado da corrida em uma linha de máquina, com `fps`, `ms_cpu`, `desenhos`, `malhas`, `vertices`, `mapa`, `altitude`, `impacto`, `fragmentos`, `largou`, `progresso`, `no_ar`, `v_vertical`, `altura_solo`, `nitro`, `nitro_usando`, `derrapando`, `dificuldade`, `posicao`, `gap` e a contagem de cada tipo de partícula. `desenhos`, `malhas` e `vertices` vêm do `frame_counters()` da engine |
+| `--json` | estado da corrida em uma linha de máquina, com `fps`, `ms_cpu`, `desenhos`, `malhas`, `vertices`, `escala`, `lan`, `batches`, `recursos` (malhas/texturas/shaders **depois** do `destruir`), `mapa`, `altitude`, `impacto`, `fragmentos`, `largou`, `progresso`, `no_ar`, `v_vertical`, `altura_solo`, `nitro`, `nitro_usando`, `derrapando`, `dificuldade`, `posicao`, `gap` e a contagem de cada tipo de partícula. `desenhos`, `malhas` e `vertices` vêm do `frame_counters()` da engine |
+
+`GIOCHI_PERFIL=1` liga o overlay F1 já no boot — é o que permite capturar um
+`--quadro` com o overlay ligado sem tecla. `GIOCHI_MODELOS=<dir>` aponta para
+outro diretório de `.obj`; sem arquivo, o modelo embutido no binário é gravado
+num diretório temporário e carregado pelo **mesmo** `load_obj_mesh`.
 
 `GIOCHI_SEM=carros,particulas,hud` desliga partes do quadro — e **só** essas três
-chaves existem. `GIOCHI_SEM=mundo` não desliga nada e não avisa: o nome da malha
-é outro (`asfalto`, `pedra`, …) e `--so mundo` é a flag que desenha só a
-geometria estática. Confundir os dois já custou duas execuções idênticas
-apresentadas como A/B. `GIOCHI_CULL=0`
-desliga o descarte de faces (para comparar). Os dois existem para **medir**, não
+chaves existem, mais `aura` e `farol` (a poça de neon sob os carros e o cone do
+farol no asfalto, medidos abaixo em [A luz que os carros jogam no
+chão](#a-luz-que-os-carros-jogam-no-chão)). `GIOCHI_SEM=mundo` não desliga nada e
+não avisa: o nome da malha é outro (`asfalto`, `pedra`, …) e `--so mundo` é a
+flag que desenha só a geometria estática. Confundir os dois já custou duas
+execuções idênticas apresentadas como A/B. `GIOCHI_CULL=0`
+desliga o descarte de faces (para comparar), e `GIOCHI_VEU=0` zera o véu das
+telas de texto — é o A/B do [véu](#o-véu-das-telas-de-texto). Os três existem
+para **medir**, não
 para jogar: num painel de 720×1280 o quadro é dominado por pixel, e sem separar
 as partes "está lento" não diz o que cortar.
+
+O `--botoes-ciclo` é o par do `--teclas-ciclo` para o controle, e existe porque
+**segurar não é apertar**: cada ação do menu é uma borda, então `--botoes baixo`
+move o cursor **uma** linha. A lista com `;` simula os toques:
+
+```bash
+# três toques no direcional para baixo, e A na linha PERFIL
+./target/release/giochi-neon-drift --frames 12 --botoes-ciclo "baixo;baixo;baixo;a" --json
+# {"menu":"perfil","menu_linha":3,"perfil":true,...}
+```
 
 `--piloto` existe porque `--passos` sozinho media outra coisa: com o acelerador
 preso, o carro batia no primeiro muro e ficava a 2,6 m/s encostado — e o quadro
@@ -689,6 +1164,80 @@ tipo; um arco custa **zero**.
 Medido no X55, com o jogo completo: **39 fps**, 45 desenhos, 770 partículas
 vivas, 26,7 MB de pico de RAM. No X35H/R35S o painel tem 1/3 dos pixels.
 
+## A luz que os carros jogam no chão
+
+Duas coisas do carro se veem de longe à noite, e nenhuma delas é a lataria: a
+**poça de neon** embaixo dele e o **cone do farol** à frente. Elas começaram como
+dois quads de cor chapada — um retângulo de borda dura e uma faixa azul de
+largura constante, que liam como adesivo no asfalto. Hoje são **máscaras de
+alfa**: o RGB da textura é branco em toda a imagem e quem desenha é o alfa, que
+cai sem degrau do ponto quente até a borda.
+
+| Máscara | Fórmula | O que resolve |
+| --- | --- | --- |
+| `halo-neon` | `(1 - r)^1,2`, com `r` a distância normalizada ao centro | a poça vira **elipse** com a proporção do carro (2,5 × 4,2 m) e apaga na borda |
+| `cone-farol` | `lateral × alcance`: meia-largura `0,45 + 0,55·v` e queda `(1 - v)^1,15` | o quad retangular vira **cone**: estreito no para-choque, aberto e apagado na ponta |
+
+As duas sobem com `create_texture_from_rgba` em 64×64 (potência de dois, então
+mipmap e `REPEAT` automáticos no GLES 2.0) e ficam **fora** de `texturas::todas()`:
+aquelas são superfícies que o `GIOCHI_TEXTURAS` troca por arquivo pintado, e um
+halo pintado à mão perderia exatamente a propriedade que importa. É a mesma
+separação do atlas de sprites.
+
+### O drift acende e esquenta
+
+`tempo_drift` do núcleo alimenta `rampa_de_drift`, que satura em 0,45 s — um
+toque de volante não pode acender a poça como um drift de três segundos. No
+auge, `tinta_da_poca` faz duas coisas e **nenhuma delas custa um pixel**:
+
+1. **acende**: alfa de 0,46 (piso) para 0,86;
+2. **esquenta**: a cor do carro puxa 40 % para o branco, e a poça pulsa a ~5,9 Hz.
+
+O pulso só existe durante o drift. Parado, um neon que pisca vira pisca-pisca e
+o jogador procura um defeito no jogo.
+
+Carro **no ar** não tem decalque nenhum: uma poça no asfalto sem emissor lê como
+sombra errada, e sombra de luz é o defeito mais visível que existe num jogo
+noturno. No cliente LAN o bit de drift do snapshot vale como auge (o protocolo
+não carrega a duração, e inventar um relógio local dessincronizaria do host).
+
+### Dois defeitos que estavam embaixo do tapete
+
+Os dois só apareceram porque a máscara tornou a luz visível o bastante para
+alguém olhar o decalque:
+
+- **A normal do decalque apontava para o horizonte.** O `flat` e o `textured`
+  calculam `0,35 + 0,65·lambert`, e a terceira coluna da matriz levava o `+Z` do
+  quad para `+Z` do mundo em vez de `+Y`. A posição não mudava (os cantos têm
+  `z = 0`), então nada quebrava: o fator travava em 0,54 e a poça saía **1,7×
+  mais escura** que o tint pedia. O teste que já existia media a normal
+  **geométrica** (produto vetorial dos eixos), que sempre deu `+Y`; a que o
+  shader lê é outra. E o `feixe()` reimplementava a matriz inteira em vez de
+  chamar o `achatar`: teria escapado da correção se não tivesse virado, nesta
+  mesma mudança, uma chamada dele.
+- **O decalque era cravado em `y = 0`.** O boavista desce de 74 m: lá a poça e o
+  farol ficavam **enterrados** sob o asfalto e o mapa simplesmente não tinha luz
+  embaixo do carro. Agora a altura é a do carro (`d[13]`) mais o offset.
+
+### O que custa
+
+| Item | Antes | Depois |
+| --- | --- | --- |
+| chamadas de desenho | 2 (poça e feixe, cor única) | **5** (poça: uma por cor de carro; feixe: uma para todos) |
+| `ms_cpu` no X55 (avenida) | 9,39 | **10,30** |
+| fps no X55 (avenida) | 38,1 | **36,9** |
+
+A poça custa uma chamada **por cor** porque `draw_instanced_textured` tem um
+`u_tint` por lote e cada carro tem a sua — e a cor é o que identifica o carro.
+Duas defesas: `agrupar_por_tinta` funde carros de mesma cor numa chamada (no LAN
+as cores vêm de uma paleta de quatro e se repetem), e `GIOCHI_SEM=aura` /
+`GIOCHI_SEM=farol` desligam cada camada para medir. O `--so` não serve aqui
+porque ele corta os carros inteiros.
+
+O custo por pixel é o mesmo de antes: a máscara **não** aumentou o quad (2,5 ×
+4,2 m e 2,6 × 7,5 m continuam os mesmos, e o comentário de 09/11 sobre os 9,6 m
+que custaram 9 fps segue valendo como aviso).
+
 ## Som sintetizado, sem um `.wav` no repositório
 
 Três sons, gerados em runtime a 22 050 Hz (`crates/ui-sdl/src/audio.rs`):
@@ -721,7 +1270,7 @@ som: não abri o dispositivo (...) — o jogo segue mudo
 
 `--sem-som` faz o mesmo por escolha, e é o que o CI usa.
 
-## As duas armadilhas de matriz de quad
+## As três armadilhas de matriz de quad
 
 Um quad é uma matriz de modelo de 4×4, e dois campos dela enganam:
 
@@ -734,6 +1283,10 @@ Um quad é uma matriz de modelo de 4×4, e dois campos dela enganam:
    normal que aponta para longe da câmera faz o desenho sumir sem erro nenhum.
    Há teste para os dois casos (`o_quad_deitado_do_carro_fica_com_a_normal_para_cima`,
    `a_normal_do_quad_deitado_aponta_para_cima`).
+3. **Tamanho pedido não é tamanho desenhado.** `hud_matriz` posiciona certo e
+   dimensiona pela metade, então "retângulo de tela cheia" cobre o quarto
+   central. Tela cheia é `hud_matriz_tela`; o caso está contado em [O véu das
+   telas de texto](#o-véu-das-telas-de-texto), com a captura que o expôs.
 
 ## Os carros corriam de ré — corrigido, com prova
 
@@ -765,6 +1318,136 @@ depois    lanternas 149 px  ·  faróis 54 px    ← de frente
 
 ![Carro antes e depois](../../../docs/imagens/neon-drift-carro-antes-depois.png)
 
+## Arquitetura depois da modernização (engine 3D 0.4.0)
+
+O jogo continua com a mesma divisão de antes — **núcleo puro** contra
+**aparelho** —, mas o lado do aparelho ganhou quatro módulos com
+responsabilidade única. A regra que os separa é a mesma de sempre: só entra
+aqui o que não pode ser testado sem GPU, rede ou controle.
+
+```text
+crates/core/                 regras puras (sem SDL, sem janela, sem rede)
+  carro.rs · drift.rs        física arcade + pontuação de drift, passo fixo
+  pista.rs · mapa.rs         traçado, relevo, rampas, obstáculos, cenários
+  corrida.rs · ia.rs         voltas, posição, desfecho, pilotos
+  relogio.rs                 teto de quadros e o passo fixo de 75 Hz
+  fonte.rs · hud.rs          texto 5×7 e formatação do HUD
+
+crates/ui-sdl/               aparelho: GLES, entrada, áudio, rede
+  main.rs                    laço, opções de linha de comando, destruição final
+  cena3d.rs                  mundo, carros, partículas, câmera e HUD 3D
+  malha.rs                   geometria procedural (cone, portal de queda)
+  modelos.rs                 caminho dos .obj + cópia embutida de segurança
+  texturas.rs                receitas procedurais POT 64×64 (+ arquivo)
+  efeitos.rs                 partículas instanciadas
+  rede.rs                    host-autoritativo LAN sobre `giochi-net`
+  menu.rs                    menu do título (mapa, dificuldade, qualidade, perfil, LAN)
+  gamepad.rs                 SDL GameController (eixos + botões)
+  perfil.rs                  profiler da engine + overlay F1
+  entrada_jogo.rs            fusão pura de teclado, bits e analógico + bordas
+  audio.rs                   síntese de motor, drift e nitro
+```
+
+### 1. Física e carro: tudo dentro do `time.delta`
+
+`Corrida::passo(&entrada, dt)` é a **única** porta de avanço da simulação, e o
+laço só a chama com `dt = TIQUE = 1/75`. Aceleração, ângulo de derrapagem,
+atrito, colisão, rampa e pontuação de drift são funções desse passo — nenhuma
+delas vê `dt` de quadro. O cliente de LAN não simula o próprio carro: recebe
+posição e a escreve no mesmo `Carro` que a câmera e as partículas leem, para
+não existirem duas verdades.
+
+O `Drift` premia o que a física cobra: pontos por `velocidade × derrapagem`,
+combo até ×5 em 4 s, e recarga de nitro proporcional ao tempo de derrapagem.
+Bater zera o combo em curso e **não** os pontos já garantidos.
+
+### 2. Pista e batching: 20 malhas para o mundo inteiro
+
+`construir_mundo` emite a geometria em **construtores por material**. Cada
+construtor vira uma malha pelo `StaticBatchBuilder` + `StaticBatch::build` da
+engine, que compõe as peças e registra o resultado no mesmo `mesh_count` /
+`release_all` das outras malhas. Medido no build de release: **20 malhas
+estáticas**, 56 a 57 chamadas de desenho no quadro inteiro (mundo + 4 carros +
+poças e feixes + partículas + HUD).
+
+| O que | Como | Por quê |
+| --- | --- | --- |
+| asfalto, concreto, pedra, mata, guarda-corpo, painel, xadrez | `BuiltinShader::Textured`, **uma** chamada por material | a cor vem do `u_tint`; a textura dá relevo |
+| faixa central, fita de barreira | `Textured` com `u_tint` **pulsante** | tracejado e grade vêm da textura, o pulso vem do uniforme |
+| postes, refletores, cones, portais | `draw_instanced`, **uma** chamada cada | mesma geometria N vezes; assar no mundo trocaria 1 chamada por N |
+| lataria dos carros | `BuiltinShader::Phong` | é o único builtin com termo especular — o neon corre na tampa |
+| vidro, rodas, faróis, lanternas | `draw_instanced` | cor única, sem brilho: não precisam de Phong |
+| poça de neon sob cada carro | `draw_instanced_textured` com máscara de alfa, **uma chamada por cor** | a poça tem a cor do carro e o `u_tint` é por lote |
+| feixe de farol no asfalto | `draw_instanced_textured`, **uma chamada para todos** | o farol é branco-frio em todos os carros |
+
+### 3. Rede LAN: host-autoritativa, dois canais
+
+`rede.rs` usa o `giochi-net` vendorizado com as features `laminar` e `mdns`:
+
+| Dado | Canal | Garantia |
+| --- | --- | --- |
+| input do cliente | `Mensagem::Input` | UDP **sequenciado** (`laminar`) |
+| posição/rotação | `Mensagem::Inimigos`, 15 Hz, filtrada por `host.definir_area()` | UDP **descartável** |
+| largada, volta, checkpoint, resultado | `Mensagem::Global` | **confiável-ordenado** (`laminar`) |
+| descoberta do lobby | mDNS `_giochi._udp.local.` | — |
+
+O snapshot reaproveita o `SnapshotInimigo` do protocolo sem mudá-lo: `hp`
+(u16) carrega o rumo quantizado em 65536 passos (0,0001 rad), `tipo` a
+velocidade e `fase_chefe` três bits de estado (no ar, derrapando, nitro). O
+cliente interpola entre as duas últimas amostras pelo caminho angular mais
+curto e **segura na ponta** quando a rede atrasa — extrapolar posição faz o
+carro atravessar a mureta e voltar.
+
+Como o `laminar` dá garantia por canal e o snapshot escuta na porta anunciada,
+o controle usa a **porta + 1**: um cliente deriva o endereço do único dado que
+o mDNS oferece.
+
+### O batimento que faltava
+
+O cliente manda um `Global` de 6 bytes (`Ola{id}`) **uma vez por segundo,
+sempre** — não só até o lobby chegar. O `laminar` fecha conexão ociosa, e
+depois disso `send` enfileira num stream que ninguém entrega. Medido: sem o
+batimento, o cliente parava de receber `Estado` ~5 s depois da largada e a
+posição congelava na última mensagem — sintoma que parece "rede lagada", mas é
+conexão morta. O teste `o_batimento_do_controle_e_mais_rapido_que_o_timeout_do_laminar`
+prende o intervalo.
+
+O tempo de corrida no cliente vem **só** do `Estado` (4 Hz): incrementá-lo
+localmente faria o cronômetro andar com a rede parada, e o sintoma seria um HUD
+que mente em vez de um cliente que parece travado. A contagem regressiva é a
+única exceção — ela roda local para o número andar entre dois pacotes, e o host
+a corrige no próximo.
+
+A posição no pelotão é calculada no **host** e viaja no `Estado`. O cálculo
+trata progresso não finito como "desconhecido": `NaN > x` é falso, e deixar a
+comparação decidir dava **1º lugar** para o carro que o host não sabia onde
+estava (`progresso_nao_finito_nao_vence_a_corrida`).
+
+### 4. Câmera: spring-arm, boost e roll
+
+`CameraJogo` integra um mola-amortecedor criticamente amortecido
+(`1 − exp(−k·dt)`, estável com quadro perdido). O braço estica com a
+velocidade **e** com o nitro (+1,1 m), o FOV abre no boost e o horizonte
+tomba no drift (`roll` proporcional à derrapagem). A câmera do HUD é ortográfica
+de fato e desenhada no painel, com a rotação do sistema aplicada como *roll* —
+é o que mantém mundo e HUD concordando no X55 retrato.
+
+### 5. Recursos: handles opacos, zero `unsafe`, zero vazamento
+
+`#![forbid(unsafe_code)]` nos dois crates. Toda malha, textura e shader é um
+handle `u64` da engine, criado no boot e liberado por `Cena3D::destruir`, que
+chama `destroy_mesh`, `destroy_texture` e `destroy_shader` um a um e só depois
+`release_all` (rede de segurança). O `--json` publica a contagem **depois** da
+destruição:
+
+```json
+"recursos":{"malhas":0,"texturas":0,"shaders":0}
+```
+
+Um número diferente de zero no smoke test é vazamento, e o `destruir` também
+imprime um `AVISO` no stderr quando isso acontece — não é preciso ler o JSON
+para descobrir.
+
 ## Sincronização com a engine 0.4.0 (13/11/2026)
 
 O upstream foi de `3785a33` (phase-18) para `0fa46ec` (release **0.4.0**), e
@@ -791,7 +1474,7 @@ a cópia:
 ### O que a 0.4.0 trouxe e o jogo passou a usar
 
 - **`Texture3D::from_file`** (PNG/BMP/JPG pelo SDL_image) → `GIOCHI_TEXTURAS=<dir>`
-  permite trocar as sete texturas de superfície sem recompilar. O `NEEDED` do
+  permite trocar as nove texturas de superfície sem recompilar. O `NEEDED` do
   binário ganhou `libSDL2_image-2.0.so.0`: é dependência de **carga** — sem a
   `.so` o processo não sobe.
 - **`LoadSurface` do SDL_image** → a folha de sprites passou a aceitar PNG e
@@ -999,9 +1682,11 @@ binário que só falha no aparelho mais antigo.
 
 ## O que este jogo **não** faz
 
-- Não tem multijogador, não tem save, não tem placar persistente.
-- Não lê analógico: os botões chegam por evdev e o eixo exigiria `absinfo` por
-  ioctl, que nenhum jogo deste repositório implementou ainda.
+- Não tem save nem placar persistente.
+- **Não prediz** o próprio carro no cliente de LAN: o cliente manda input e
+  interpola o que o host devolve. Em LAN o RTT é de 1–4 ms; predição resolveria
+  um problema que não existe e criaria dessincronização sem forma de reproduzir.
+- Não usa NAT traversal nem relay: **LAN apenas**, como o `giochi-net` declara.
 - Não usa `SDL2_ttf`: o texto é uma fonte 5×7 em dados (`crates/core/src/fonte.rs`),
   porque o aparelho pode não ter a biblioteca e um jogo que depende dela não
   abre.
@@ -1011,13 +1696,33 @@ binário que só falha no aparelho mais antigo.
 ```text
 crates/core/     regras puras: mapa, pista, carro, drift, IA, corrida, fonte,
                  HUD, relógio e o piloto artificial. Sem SDL, sem janela e sem
-                 arquivo: 128 testes.
+                 arquivo: 146 testes.
 crates/ui-sdl/   cena 3D, efeitos, malhas, texturas e atlas de sprites
-                 procedurais (ou folha externa em BMP), áudio, evdev, entrada e o
-                 laço. É a única parte que precisa de tela: 123 testes.
-vendor/          cópia isolada da GIOCHI-ENGINE-3D. A engine original é outro
-                 repositório e **não** é editada por este app.
+                 procedurais (ou folha externa em BMP), áudio, evdev, gamepad,
+                 rede LAN, menu do título, perfil e o laço. É a única parte que
+                 precisa de tela: 211 testes.
+vendor/          cópia isolada da GIOCHI-ENGINE-3D 0.4.0 e do `giochi-net`
+                 (features `laminar` e `mdns`). A engine original é outro
+                 repositório e **não** é editada por este app; as duas adições
+                 locais estão listadas na seção de sincronização.
+assets/modelos/  `carro.obj` e `portal.obj`. Gerados por
+                 `scripts/gerar-modelos.mjs`; o jogo carrega por
+                 `render.load_obj_mesh` e, se o arquivo faltar no aparelho, usa
+                 uma cópia embutida no binário — mesmo caminho de carga nos dois
+                 casos.
+scripts/         `gerar-modelos.mjs`: regera os dois `.obj` com winding
+                 anti-horário para fora. Rodar depois de mudar proporções.
 TEXTURAS.md      guia de arte: tamanho, canais, escala no mundo, faixa de
                  luminância, as três armadilhas de BMP e onde mexer para cada
                  mudança.
 ```
+
+### O que roda onde
+
+| Comando | Precisa de | Prova |
+| --- | --- | --- |
+| `cargo test --workspace` | nada | 313 testes: física, pista, rede (codificação/interpolação), texturas, fonte |
+| `--frames N` + `offscreen` | nada | o laço desenha N quadros e o `--json` publica fps, draw calls e `recursos` zerados |
+| `--quadro q.bmp` | GLES (offscreen serve) | um quadro real em disco, para medir luminância e conferir orientação |
+| `--lan-host` / `--lan-entrar` | soquete UDP | duas instâncias conversam; o cliente recebe posição e o host vê o id |
+| `--target aarch64-unknown-linux-gnu` | sysroot ARM + SDL2 do sistema | o binário do aparelho, `NEEDED` = SDL2 + SDL2_image + libc/libm/libgcc_s |

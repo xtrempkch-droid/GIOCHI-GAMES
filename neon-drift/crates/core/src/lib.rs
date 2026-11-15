@@ -7,6 +7,7 @@
 //! clássico deste repositório, o de uma regra que só podia ser conferida
 //! olhando o aparelho.
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod carro;

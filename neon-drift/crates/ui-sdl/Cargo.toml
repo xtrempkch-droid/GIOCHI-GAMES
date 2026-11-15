@@ -17,6 +17,8 @@ giochi-neon-drift-core = { path = "../core" }
 # alguém atualizar a cópia de propósito.
 giochi-engine = { path = "../../vendor/giochi-engine", default-features = false, features = ["sdl2-system", "profiling"] }
 giochi-engine-3d = { path = "../../vendor/giochi-engine-3d", default-features = false, features = ["sdl2-system", "profiling"] }
+# LAN host-autoritativa: `laminar` garante entrega/ordem do controle de corrida
+# e `mdns` descobre lobbies sem IP digitado. As duas features são puras em Rust;
+# ver `vendor/giochi-net/Cargo.toml` para o recorte de dependências.
+giochi-net = { path = "../../vendor/giochi-net", features = ["laminar", "mdns"] }
 sdl2 = { version = "0.38", default-features = false }
-# `libc` já vem pelo `sdl2`; declarado para uma linha só (restaurar `SIGPIPE`).
-libc = "0.2"

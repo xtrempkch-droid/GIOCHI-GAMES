@@ -6,6 +6,12 @@ chegando de todas as direções, e uma câmera orbital para mirar.
 Roda sobre a **GIOCHI-ENGINE** (SDL2/KMSDRM) e a **GIOCHI-ENGINE-3D** (GLES 2.0
 sobre EGL), ambas consumidas de um snapshot local em `vendor/`.
 
+> **Alvo: handheld — não é um jogo de PC** (regra **R4** do
+> [`AGENTS.md`](../AGENTS.md#41-r4--alvo-handheld-não-pc)). O binário versionado é
+> `aarch64` com KMSDRM e joga-se no controle, na mão; o `x86_64` é **bancada** de
+> medição e de teste sem ecrã — serve para `cargo test` e para o quadro
+> offscreen, nunca para entregar.
+
 ## Estado
 
 **Os nove blocos do plano estão fechados (1a–3c)** — arena com iluminação
@@ -101,10 +107,17 @@ A HUD mostra **VIDA** (cinco marcadores que se apagam), **ONDA n/3** e
 **PONTOS** no topo. Cada abate nasce como `+100` no ponto do impacto, o dano no
 asteroide acende as bordas de vermelho, e a partida termina com o aviso e o
 placar no centro.
-- **roda do mouse** — aproxima/afasta (5 a 15 unidades)
-- **setas / WASD** — orbita sem mouse
+- **roda do mouse** — aproxima/afasta (5 a 15 unidades) — **sem equivalente no
+  controle** (ver a pendência abaixo)
+- **setas / WASD** — orbita sem mouse (bancada)
 - **analógico direito** — orbita no controle
-- **ESC** — sai
+- **ESC** — sai (no controle, `B` a partir do menu)
+
+> **Pendência R4 (registrada, não corrigida):** o `camera.zoom` só é chamado por
+> `entrada.mouse().wheel_delta()` (`src/main.rs:893`). O direcional e o analógico
+> direito orbitam, mas **não aproximam**: num handheld a distância da câmera fica
+> travada. A correção óbvia é dar o zoom a um par de botões livres (ombros) — e
+> isso muda o mapa documentado, então fica registrado antes de ser feito.
 
 O tiro é um raio do centro da tela na direção da câmera, e acerta o **primeiro**
 cubo no caminho: um cubo atrás do asteroide não é atingido por acidente. A folga

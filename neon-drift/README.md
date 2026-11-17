@@ -4,6 +4,19 @@ Corrida arcade 3D noturna, em Rust, sobre a **GIOCHI-ENGINE-3D** e o KMSDRM do
 aparelho. Um jogador, três adversários, **cinco pistas** e um teto rígido de
 **75 fps**.
 
+> **Alvo: handheld — não é um jogo de PC.** Roda em `aarch64` com KMSDRM, num
+> painel de 3,5" e **só com o controle na mão**: sem teclado, sem mouse, sem
+> tela de toque. O PC (`x86_64`) é **bancada de medição** — serve para
+> `cargo test`, para o quadro offscreen e para o A/B de desempenho, nunca para
+> entregar. Um binário de PC que funcione não fecha item; o que fecha é
+> `--quadro` no painel real e `--json` de uma corrida no aparelho. A regra é
+> **R4** do [`AGENTS.md`](../AGENTS.md#41-r4--alvo-handheld-não-pc).
+>
+> Consequência prática: o binário versionado é sempre ARM64 (`bin/`), o teclado
+> é atalho de desenvolvimento, e toda ação tem de ter botão equivalente — foi o
+> que a [revisão de controles](#revisão-de-controles-o-teclado-deixou-de-ser-necessário)
+> teve de corrigir depois do fato.
+
 O teto é de **simulação**, não de desenho: a física roda em passo fixo de 75 Hz e
 o laço só desenha o que couber. Quanto cada aparelho entrega está na tabela de
 [desempenho](#desempenho-medido-nos-três-aparelhos) — e o que sobra até 75 é do
@@ -13,7 +26,8 @@ painel, não do jogo: no R35S, cujo display é de 60 Hz, **uma malha só** já m
 um quadro por vblank e o flip **não** se sobrepõe ao desenho.
 
 ```bash
-cargo test --workspace                        # 211 (ui-sdl) + 146 (core, 2 ignorados)
+# bancada de x86_64: medir e testar. Nada aqui é entrega (R4).
+cargo test --workspace                        # 241 (ui-sdl) + 146 (core, 2 ignorados)
 cargo build --release
 cargo clippy --workspace --all-targets        # zero erro; o jogo e o núcleo são forbid(unsafe_code)
 SDL_VIDEODRIVER=offscreen ./target/release/giochi-neon-drift --quadro /tmp/q.bmp
@@ -810,8 +824,8 @@ eram inalcançáveis justamente onde mais importam.
 
 | Botão | Na corrida | No menu (título) |
 | --- | --- | --- |
-| A / gatilho direito | acelerar | **aceitar** a linha |
-| B / gatilho esquerdo | frear / ré | — |
+| A | acelerar | **aceitar** a linha |
+| B | frear / ré | — |
 | analógico / direcional | virar, acelerar (↑) e frear (↓) | **↑↓** move o cursor |
 | direcional ← / → | virar | **muda o valor** da linha |
 | L1 / R1 | freio de mão (**é o que liga o drift**) | — |
@@ -845,7 +859,12 @@ A **dificuldade** explica a si mesma na linha de baixo ("adversários 12% mais
 lentos"), porque "desafiante" sem explicação faz o jogador sentir o carro lento
 e chamar de bug.
 
-### Teclado (PC)
+### Teclado (PC) — bancada, não suporte
+
+O teclado existe porque desenvolver no aparelho é lento. Ele **não** é suporte a
+um alvo de PC (R4): nada aqui depende dele para ser jogável, e uma ação que só
+exista em tecla é defeito. O `--teclas`/`--teclas-ciclo` existem pelo mesmo
+motivo — provar por script o que um dedo faria.
 
 | Tecla | Ação |
 | --- | --- |
@@ -864,40 +883,168 @@ e chamar de bug.
 
 ### Gamepad pelo SDL, com analógico e gatilhos
 
-O evdev lê o controle cru do aparelho — é o caminho de produção no R35S, onde o
-mapeamento do sistema já está certo. O `gamepad.rs` cobre o resto (PC, controle
-USB genérico, SDL atualizado): abre o primeiro `GameController`, lê **estado** a
-cada quadro (não evento — corrida precisa de "quanto", e um evento entre dois
-passos do timestep fixo se perderia) e entrega:
+O `gamepad.rs` abre o primeiro `GameController` do SDL, lê **estado** a cada
+quadro (não evento — corrida precisa de "quanto", e um evento entre dois passos
+do timestep fixo se perderia) e entrega:
 
 | Entrada | Vai para |
 | --- | --- |
-| gatilho direito (`TriggerRight`) | `acelerar`, proporcional `0..1` |
-| gatilho esquerdo (`TriggerLeft`) | `frear`, proporcional `0..1` |
-| analógico esquerdo (`LeftX`) | `virar`, com zona morta de 0,16 **reescalada** |
+| A, B, X, Y | `ACELERAR`+`ACEITAR`, `FREAR`, `PERFIL`, `VOLTAR` — os nomes `a`, `b`, `x`, `y` |
+| L1 / R1 (`LeftShoulder`, `RightShoulder`) | freio de mão (`l`, `r`) |
+| L2 / R2 (`TriggerLeft`, `TriggerRight`, como **eixo**) | nitro (`l2`, `r2`) |
+| START / SELECT (`Start`, `Back`) | `INICIAR` / `VOLTAR` |
 | D-Pad | `CIMA`/`BAIXO`/`ESQUERDA`/`DIREITA` — os mesmos bits do evdev |
-| A, B, X, Y | `ACELERAR`+`ACEITAR`, `FREAR`, `PERFIL`, `VOLTAR` |
-| L1 / R1 / START / SELECT | freio de mão / nitro / `INICIAR` / `VOLTAR` |
+| analógico esquerdo (`LeftX`) | `virar`, com zona morta de 0,16 **reescalada** |
 
-**A mesma tecla faz a mesma coisa nos dois caminhos.** Até a revisão de
-controles, o evdev tinha `A = acelerar` e o SDL `A = freio de mão`: o mesmo
-botão, dois significados, conforme quem abrisse o controle. Hoje os dois falam
-o vocabulário de **botão físico** (`evdev::bit_do_codigo`) e quem traduz botão
-em intenção é `entrada_jogo::combinar_com_analogico`, onde as regras dão para
-testar sem aparelho.
+A tabela acima é o **nome do `buttons.map`** (`a`, `l`, `r2`), não a posição no
+plástico — é o vocabulário do contrato, e o teste
+`o_mapa_do_sdl_e_o_do_buttons_map` compara esta tabela com `evdev::bit_do_nome`
+linha a linha.
 
-O direcional acende `CIMA`/`BAIXO`, e **não** `ACELERAR`/`FREAR`: se acendesse,
-soltar o direcional apagaria o bit do A que o jogador continua segurando e o
-carro pararia de acelerar sozinho na reta. A fusão lê `CIMA` como acelerar, e
-há teste para isso.
+Não há acelerador analógico: o contrato declara `a` como acelerar, e ler o eixo
+do gatilho como acelerador transformava o R2 em **acelerar e nitro no mesmo
+quadro** — o defeito da issue #1 por outra porta. O volante analógico continua,
+porque o `evdev` deste jogo só lê `EV_KEY` e o SDL é a única fonte dele.
 
-Teclado, bits e analógico **somam com `max`** em cada canal, e o resultado é
-limitado a 1: apertar acelerar na seta e no gatilho não dá o dobro de
-aceleração. A fusão é função pura (`entrada_jogo::combinar_com_analogico`) e os
-testes dela rodam sem controle plugado.
+A zona morta do contrato (`flat=32` numa faixa de 65534, ~0,05 % do curso) é a
+do **sistema**; o jogo mantém a dele (0,16, reescalada) porque o que precisa de
+proteção é a mão no aparelho, não o eixo. As duas convivem e não se somam: a do
+sistema corta o ruído elétrico antes do SDL, a do jogo corta o tremor do
+polegar.
 
-A zona morta **reescala** o resto do curso: sem isso o primeiro milímetro depois
-dela salta de 0 para 0,16 e a correção fina de drift fica quadrada.
+### O contrato de entrada: um mapa, uma tradução, nenhum caminho alternativo
+
+O GIOCHI-SYSTEM passou a publicar **um controle virtual**, o `Giochi Gamepad`
+(issue #2 do repositório): um nó só, 17 botões de códigos fixos e quatro eixos
+em -32767..32767, com `flat=32` e GUID estável. O `gamecontrollerdb.txt` da
+imagem mapeia `a:b1`, então o `Button::A` do SDL é o `a` do `buttons.map` em
+**todas** as placas.
+
+```text
+ R35S  um nó: 17 BTN + 4 eixos ─┐
+ X55   dois nós: BTN | eixos   ─┼──▶ giochi-gamepad ──▶ "Giochi Gamepad"
+ X35H  dois nós: BTN | eixos   ─┘     (S52gamepad)      17 botões, 4 eixos
+```
+
+Isso muda a regra do jogo: **não** enumerar `/dev/input/event*` e somar tudo —
+mirar o contrato, e escolher **uma** fonte por quadro.
+
+#### O que ficou errado depois da issue #1
+
+A correção da #1 escolheu um dono por quadro, mas deixou duas coisas tortas:
+
+| Peça | Antes | Agora |
+| --- | --- | --- |
+| `/dev/input` | lia **todos** os `event*` e somava | só o `Giochi Gamepad`, se ele existir |
+| Mapa do virtual | usaria o `buttons.map` da placa | usa o **layout fixo** — o virtual já é a tradução |
+| R1/R2 no caminho SDL | R1 = nitro, R2 = acelerador | R1/R2 = **freio de mão**, L2/R2 = **nitro** (`l`/`r` e `l2`/`r2`) |
+| Acelerador analógico | gatilho direito | **não existe**: o contrato declara `a` como acelerar |
+
+O R1/R2 era a divergência que a issue #1 tinha medido e que só não aparecia
+porque o evdev vencia a disputa. E há um detalhe que parece detalhe e não é: o
+**virtual não leva o mapa da placa**. Na X35S o `buttons.map` diz
+`a = BTN_SOUTH` (o físico); aplicar esse mapa ao virtual inverteria o A/B,
+porque o virtual já normalizou tudo para o layout da X55. Um teste fixa isso
+(`o_virtual_usa_o_layout_fixo_e_nao_o_mapa_da_placa`).
+
+#### A precedência, e o porquê de cada degrau
+
+```rust
+// entrada_jogo.rs
+pub fn dono(fontes: Fontes, forcar: Forcar) -> Dono
+```
+
+| # | Condição | Dono | Por quê |
+| --- | --- | --- | --- |
+| 1 | nó `Giochi Gamepad` aberto no evdev | **evdev** | códigos fixos, não depende do `gamecontrollerdb` |
+| 2 | controle do SDL **é** o `Giochi Gamepad` | sdl | o `gamecontrollerdb` garante `Button::A = a` |
+| 3 | físico + `/etc/giochi/buttons.map` | evdev | imagem antiga: o mapa é a única descrição do plástico |
+| 4 | controle no SDL | sdl | o PC, onde o `Button::A` **é** `BTN_SOUTH` de verdade |
+| — | nada | — | só teclado |
+
+`GIOCHI_CONTROLE=sdl|evdev` fura a precedência, mas nunca devolve uma fonte que
+não exista: ficar sem controle é pior que usar o mapa do outro caminho.
+
+#### O mapa do plástico continua sendo **dado**
+
+Nas imagens sem o virtual (e no caminho do evdev sobre nó físico), o
+`buttons.map` da placa continua mandando — e ele é lido do arquivo, não
+compilado. Rodado contra os quatro mapas reais do GIOCHI-SYSTEM
+(`GIOCHI_MAPA_BOTOES=<arquivo> giochi-neon-drift --mapa-botoes`):
+
+| Aparelho | `a =` no mapa | linha que o jogo imprime |
+| --- | --- | --- |
+| X55 | `BTN_EAST` | `305 -> ACELERAR\|ACEITAR` |
+| X35H | `BTN_EAST` | `305 -> ACELERAR\|ACEITAR` |
+| R35S | `BTN_EAST` | `305 -> ACELERAR\|ACEITAR` |
+| **X35S** | **`BTN_SOUTH`** | **`304 -> ACELERAR\|ACEITAR`** |
+
+A **X35S troca A e B de propósito** no device tree, e é a placa que a tabela
+compilada errava. Um `match` fixo acerta três e erra a quarta; um arquivo acerta
+as quatro — e o virtual dispensa o arquivo.
+
+#### Os dois caminhos falam o mesmo vocabulário, e há teste
+
+`gamepad::bit_do_botao` e `evdev::bit_do_nome` são a mesma tabela escrita duas
+vezes, uma para o nome do SDL e outra para o nome do `buttons.map`.
+`o_mapa_do_sdl_e_o_do_buttons_map` compara as duas linha a linha; é ele que
+impede a divergência de voltar. Um botão que fique de fora de `BOTOES` (a lista
+que o laço percorre) é um botão mudo, e `a_lista_de_botoes_nao_deixa_botao_mudo`
+pega.
+
+O `sdl2` 0.38 **não** expõe `Button::Trigger*`: os gatilhos só existem como
+eixo. Quando o `gamecontrollerdb` liga o gatilho a um botão (`righttrigger:b7`),
+o próprio SDL sintetiza o eixo como 0 ou 32767 — por isso a leitura é a mesma
+nos dois casos, e `nada além do A acende ACELERAR`.
+
+#### Como se verifica
+
+```bash
+# o mapa em vigor, o contrato e quem manda nos botões — sem abrir janela
+giochi-neon-drift --mapa-botoes
+# fonte: embutido (a = BTN_EAST) — /etc/giochi/buttons.map não é legível
+# ...
+# 1 dispositivo(s), 1 controle(s), contrato: ausente
+# botoes: nenhum (evdev) · sdl (se o SDL tiver controle)
+
+# e no --json, para script:
+giochi-neon-drift --quadros 60 --json \
+  | jq -r '.contrato_evdev, .contrato_sdl, .mapa_do_sistema, .botoes_de'
+```
+
+Como não há `uinput` sem root, o caminho do aparelho é provado no PC apontando
+`GIOCHI_INPUT_DIR`/`GIOCHI_SYSFS_INPUT` para uma árvore de mentira (`event0` com
+o nome `Giochi Gamepad` e um `EV_KEY BTN_EAST` pressionado). Medido, `--quadros
+600 --tela corrida`:
+
+| Árvore de entrada | `contrato_evdev` | `mapa_do_sistema` | `botoes_de` | `velocidade` |
+| --- | --- | --- | --- | --- |
+| `Giochi Gamepad` | **true** | false | **evdev** | **40,7 m/s** |
+| `gpio-keys-control` + `GIOCHI_MAPA_BOTOES` (X55) | false | true | evdev | 40,7 m/s |
+| `gpio-keys-control` sem mapa | false | false | **sdl** | 0,0 |
+| nada | false | false | sdl | 0,0 |
+
+O A do virtual acelera de fato; o mesmo evento num nó físico **sem** mapa não
+acelera, porque quem manda é o SDL.
+
+#### O nó que morre não deixa botão preso
+
+Um `read` de evdev devolve `ENODEV` quando o nó é destruído — o `S52gamepad`
+reiniciar basta. Sem tratar isso, `contrato` ficava `true` para sempre e a
+máscara congelava no último estado: o A apertado no instante do restart deixava
+o carro acelerando, e o nó novo (que pode reusar o mesmo `eventN`) nunca era
+relido. Cada leitor leva um `AtomicBool` de vida; a varredura de 2 s enterra os
+mortos, zera a máscara do contrato e devolve o caminho para reabertura
+(`o_contrato_que_morre_nao_deixa_botao_preso`).
+
+#### Um teste que falha de propósito
+
+`o_r1_nao_da_nitro_quando_o_evdev_manda` e
+`o_r2_nao_acelera_quando_o_evdev_manda` (do ciclo da #1) viraram
+`o_r2_e_nitro_e_o_r1_e_freio_de_mao`, e os testes de decisão
+(`o_contrato_pelo_evdev_vence_tudo`, `a_mascara_e_a_do_dono_e_nunca_a_soma`,
+`com_o_contrato_os_nos_fisicos_nao_sao_lidos`) falham contra a versão que somava
+as máscaras.
 
 ### Escala de render: o botão do fill-rate
 
@@ -937,15 +1084,22 @@ A revisão fez quatro coisas:
 3. **`Y` na corrida voltou a significar "menu"**, não "matar o processo". Antes,
    um dedo escorregado no botão ao lado do B fechava o jogo — e sem uma tecla
    `Esc` não havia como chegar ao menu para trocar a escala.
-4. **O caminho do controle e o do evdev agora falam a mesma língua.**
+4. **O caminho do controle e o do evdev falam o mesmo vocabulário** (`u32` de
+   bits de botão). O **mapa** é que não pode ser o mesmo: o evdev lê código
+   físico e o SDL lê posição de botão. Foi essa confusão, e não o valor de um
+   botão, que produziu o [A que freia no
+   R35S](#o-contrato-de-entrada-um-mapa-uma-tradução-nenhum-caminho-alternativo).
 
 ### Os três defeitos que a revisão achou
 
 - **`A` queria dizer duas coisas.** No evdev, `A` acendia `ACELERAR`; no SDL,
   `FREIO_MAO`. O mesmo botão, dois significados, conforme quem abrisse o
   controle — e nenhum teste pegava, porque cada caminho era testado sozinho.
-  Hoje a máscara descreve o **botão físico** e quem traduz botão em intenção é a
-  fusão, com teste.
+  A revisão alinhou os dois ao vocabulário de botão físico do evdev, o que
+  **não** bastou: no R35S o `A` do plástico é `b1` no SDL, e a soma das máscaras
+  voltou a acender acelerar e frear juntos. A correção definitiva é um dono por
+  quadro, e depois substituída pelo [contrato de
+  entrada](#o-contrato-de-entrada-um-mapa-uma-tradução-nenhum-caminho-alternativo).
 - **O direcional acendia `ACELERAR`.** Parece inofensivo até o jogador segurar o
   `A`, tocar o direcional e soltar: o `fetch_and(!bit)` do evdev apagava
   `ACELERAR` e o carro parava de acelerar sozinho no meio da reta. O direcional
@@ -985,6 +1139,12 @@ $B --frames 14 --botoes-ciclo "start;y" --json | jq -r .fase     # Titulo
 O `--json` publica `menu` (a linha do cursor), `menu_linha`, `perfil`, `lan` e
 `lan_acao`: sem esses campos o estado do menu só existiria na tela, e "o
 direcional funciona" voltaria a ser fé.
+
+`controles_evdev`, `gamepad_sdl`, `mapa_do_sistema`, `contrato_evdev`,
+`contrato_sdl` e `botoes_de` respondem "de onde veio o que o jogador apertou" —
+é o diagnóstico do [contrato de entrada](#o-contrato-de-entrada-um-mapa-uma-tradução-nenhum-caminho-alternativo).
+`GIOCHI_CONTROLE=sdl` também aparece aí: com ele `botoes_de` diz `sdl` mesmo com
+o contrato aberto no evdev.
 
 ## Como o teto de 75 fps é garantido
 
@@ -1045,14 +1205,22 @@ limitado por fragmento é ele que libera; no X55 ele não tem o que liberar.
 | `--escala 0.75` | desenha em resolução menor e estica (Upscaler da engine; `GIOCHI_ESCALA`) |
 | `--atlas a.bmp` | grava o atlas de sprites e sai, **sem abrir janela** |
 | `--texturas t.bmp` | grava as 9 texturas lado a lado, **sem abrir janela** — o molde para pintar |
+| `--mapa-botoes` | imprime o mapa código evdev → bits em vigor, a origem dele e quem manda nos botões; **sem abrir janela** — é a conferência do `buttons.map` no aparelho |
+| `GIOCHI_INPUT_DIR` / `GIOCHI_SYSFS_INPUT` | apontam `/dev/input` e `/sys/class/input` para outra árvore — é como se prova o caminho do contrato no PC, sem `uinput` |
 | `--lan-host` / `--lan-entrar IP[:porta]` | sobe/entra numa corrida LAN; `--lan-procurar` descobre o lobby por mDNS e `--lan-porta` troca a porta (controle = porta + 1) |
 | `--prova-rotacao b.bmp` | três barras de cor conhecida em coordenadas de projeto, com posição prevista em número. Separa "o mundo girou errado" de "o HUD girou errado" sem olhar a tela |
-| `--json` | estado da corrida em uma linha de máquina, com `fps`, `ms_cpu`, `desenhos`, `malhas`, `vertices`, `escala`, `lan`, `batches`, `recursos` (malhas/texturas/shaders **depois** do `destruir`), `mapa`, `altitude`, `impacto`, `fragmentos`, `largou`, `progresso`, `no_ar`, `v_vertical`, `altura_solo`, `nitro`, `nitro_usando`, `derrapando`, `dificuldade`, `posicao`, `gap` e a contagem de cada tipo de partícula. `desenhos`, `malhas` e `vertices` vêm do `frame_counters()` da engine |
+| `--json` | estado da corrida em uma linha de máquina, com `fps`, `ms_cpu`, `desenhos`, `malhas`, `vertices`, `escala`, `lan`, `batches`, `controles_evdev`, `gamepad_sdl`, `botoes_de` (quem manda nos botões: `evdev`/`sdl`/`nenhum`), `recursos` (malhas/texturas/shaders **depois** do `destruir`), `mapa`, `altitude`, `impacto`, `fragmentos`, `largou`, `progresso`, `no_ar`, `v_vertical`, `altura_solo`, `nitro`, `nitro_usando`, `derrapando`, `dificuldade`, `posicao`, `gap` e a contagem de cada tipo de partícula. `desenhos`, `malhas` e `vertices` vêm do `frame_counters()` da engine |
 
 `GIOCHI_PERFIL=1` liga o overlay F1 já no boot — é o que permite capturar um
 `--quadro` com o overlay ligado sem tecla. `GIOCHI_MODELOS=<dir>` aponta para
 outro diretório de `.obj`; sem arquivo, o modelo embutido no binário é gravado
 num diretório temporário e carregado pelo **mesmo** `load_obj_mesh`.
+
+`GIOCHI_CONTROLE=sdl|evdev` fura a precedência de quem manda nos botões;
+`GIOCHI_MAPA_BOTOES=<arquivo>` aponta para outro `buttons.map`; e
+`GIOCHI_INPUT_DIR`/`GIOCHI_SYSFS_INPUT` trocam as árvores de `/dev/input` e
+`/sys/class/input`. Os quatro são A/B do [contrato de
+entrada](#o-contrato-de-entrada-um-mapa-uma-tradução-nenhum-caminho-alternativo).
 
 `GIOCHI_REDE_DEBUG=1` faz o **host** escrever, a cada envio de estado, o
 progresso de si mesmo e de cada cliente (`prog`, `pos`, `volta`). Sem esses
@@ -1782,6 +1950,10 @@ binário que só falha no aparelho mais antigo.
 
 ## O que este jogo **não** faz
 
+- **Não é um jogo de PC.** Não sai instalador, `.desktop`, AppImage, flatpak nem
+  alvo Windows/macOS, e o binário versionado é `aarch64`. O `x86_64` existe para
+  `cargo test`, para o quadro offscreen e para o A/B de desempenho — é bancada,
+  não entrega (R4 do [`AGENTS.md`](../AGENTS.md#41-r4--alvo-handheld-não-pc)).
 - Não tem save nem placar persistente.
 - **Não prediz** o próprio carro no cliente de LAN: o cliente manda input e
   interpola o que o host devolve. Em LAN o RTT é de 1–4 ms; predição resolveria
@@ -1800,7 +1972,7 @@ crates/core/     regras puras: mapa, pista, carro, drift, IA, corrida, fonte,
 crates/ui-sdl/   cena 3D, efeitos, malhas, texturas e atlas de sprites
                  procedurais (ou folha externa em BMP), áudio, evdev, gamepad,
                  rede LAN, menu do título, perfil e o laço. É a única parte que
-                 precisa de tela: 211 testes.
+                 precisa de tela: 241 testes.
 vendor/          cópia isolada da GIOCHI-ENGINE-3D 0.4.0 e do `giochi-net`
                  (features `laminar` e `mdns`). A engine original é outro
                  repositório e **não** é editada por este app; as duas adições

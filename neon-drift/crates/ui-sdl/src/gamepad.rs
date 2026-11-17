@@ -1,9 +1,23 @@
 //! Gamepad pelo subsistema de controle do SDL2.
 //!
-//! O `evdev` continua sendo o caminho do aparelho (lê o controle cru, sem
-//! depender do mapeamento do SDL). Este módulo é o caminho **portátil**: no PC,
-//! no R35S com SDL atualizado e em qualquer controle com mapeamento conhecido,
-//! o SDL entrega eixos e botões já normalizados.
+//! Com o contrato do GIOCHI-SYSTEM (issue #2) este é o caminho **preferido**:
+//! o `Giochi Gamepad` é um `GameController` de verdade em todas as placas, e o
+//! `gamecontrollerdb` da imagem faz `Button::A` ser o `a` do `buttons.map`.
+//!
+//! ## O que o SDL **não** garante sozinho
+//!
+//! Sem o contrato, o SDL chama de `Button::A` o **primeiro** botão que o device
+//! declara em `EV_KEY`, que nas placas do projeto é `BTN_SOUTH` — o **B**
+//! serigrafado. Medido no R35S com o `sdl-input-probe` do GIOCHI-SYSTEM:
+//! `a:b0`, `b0 = BTN_SOUTH`. É por isso que ele não é usado às cegas em imagem
+//! antiga, e por isso a máscara dele nunca é **somada** à do `evdev` (issue
+//! #1): quem decide é [`crate::entrada_jogo::dono`], uma fonte por quadro.
+//!
+//! ## Por que o mapa daqui é o nome do `buttons.map`
+//!
+//! `Button::A` = `a`, `LeftShoulder` = `l`, `RightTrigger` = `r2`. É o
+//! vocabulário do contrato, o mesmo do `evdev::bit_do_nome`, e há teste que
+//! compara os dois — divergir de novo é o defeito da issue #1.
 //!
 //! ## Por que ler o estado a cada quadro, e não por evento
 //!
@@ -78,6 +92,18 @@ impl Gamepad {
         self.controle.is_some()
     }
 
+    /// O controle aberto é o **contrato** (`Giochi Gamepad`)?
+    ///
+    /// É o que permite o degrau 2 de [`crate::entrada_jogo::dono`]: com o
+    /// `gamecontrollerdb` da imagem, neste device o `Button::A` do SDL é o `a`
+    /// do `buttons.map`, e o caminho do SDL passa a dispensar a tabela por
+    /// aparelho.
+    pub fn contrato(&self) -> bool {
+        self.nome
+            .as_deref()
+            .is_some_and(|n| n.trim() == crate::evdev::NOME_DO_CONTRATO)
+    }
+
     /// Máscara de botões, no mesmo vocabulário do `evdev`.
     pub fn bits(&self) -> u32 {
         self.bits
@@ -105,62 +131,32 @@ impl Gamepad {
             return;
         };
 
-        use crate::evdev as b;
         let mut bits = 0;
-        // O mapa é o **mesmo** do evdev (`evdev::bit_do_codigo`), botão por
-        // botão. Até a revisão de controles o caminho do SDL tinha um mapa
-        // próprio — `A` era freio de mão aqui e acelerar no aparelho —, e a
-        // mesma tecla fazia coisas diferentes conforme quem abrisse o controle.
-        //
-        // Os gatilhos analógicos entram como eixos (`Analogico`), então o `A`
-        // acelera **e** aceita, igual ao aparelho.
-        if c.button(Button::A) {
-            bits |= b::ACELERAR | b::ACEITAR;
+        for botao in BOTOES {
+            if c.button(botao) {
+                bits |= bit_do_botao(botao).unwrap_or(0);
+            }
         }
-        if c.button(Button::B) {
-            bits |= b::FREAR;
-        }
-        if c.button(Button::X) {
-            bits |= b::PERFIL;
-        }
-        if c.button(Button::Y) || c.button(Button::Back) {
-            bits |= b::VOLTAR;
-        }
-        if c.button(Button::LeftShoulder) {
-            bits |= b::FREIO_MAO;
-        }
-        if c.button(Button::RightShoulder) {
-            bits |= b::NITRO;
-        }
-        if c.button(Button::Start) {
-            bits |= b::INICIAR;
-        }
-        // Direcional: o valor contínuo da navegação sai em `bits` e o volante
-        // analógico em `Analogico`.
-        if c.button(Button::DPadLeft) {
-            bits |= b::ESQUERDA;
-        }
-        if c.button(Button::DPadRight) {
-            bits |= b::DIREITA;
-        }
-        if c.button(Button::DPadUp) {
-            bits |= b::CIMA;
-        }
-        if c.button(Button::DPadDown) {
-            bits |= b::BAIXO;
-        }
-        self.bits = bits;
 
         let eixo = |v: i16| (f32::from(v) / 32767.0).clamp(-1.0, 1.0);
         let gatilho = |v: i16| (f32::from(v) / 32767.0).clamp(0.0, 1.0);
+
+        // Os gatilhos são `l2`/`r2` = **nitro**, e não acelerador. Quando o
+        // `gamecontrollerdb` liga o gatilho a um botão (`righttrigger:b7`), o
+        // próprio SDL sintetiza o eixo como 0 ou 32767 — por isso a leitura é a
+        // mesma nos dois casos, e o limiar é que decide.
+        //
+        // O `sdl2` 0.38 não expõe `Button::Trigger*`: o gatilho só existe como
+        // eixo, então ele não entra em `BOTOES` e é lido aqui.
+        if acima_do_limiar(gatilho(c.axis(Axis::TriggerRight))) > 0.0
+            || acima_do_limiar(gatilho(c.axis(Axis::TriggerLeft))) > 0.0
+        {
+            bits |= crate::evdev::NITRO;
+        }
+
         let virar = com_zona_morta(eixo(c.axis(Axis::LeftX)), ZONA_MORTA);
-        let acelerar = gatilho(c.axis(Axis::TriggerRight));
-        let frear = gatilho(c.axis(Axis::TriggerLeft));
-        self.analogico = Analogico {
-            virar,
-            acelerar: acima_do_limiar(acelerar),
-            frear: acima_do_limiar(frear),
-        };
+        self.bits = bits;
+        self.analogico = Analogico { virar };
     }
 
     fn tentar_abrir(&mut self) {
@@ -190,6 +186,55 @@ impl Gamepad {
             }
         }
     }
+}
+
+/// Todos os botões que têm bit do jogo — menos os gatilhos, que o `sdl2` só
+/// expõe como eixo.
+///
+/// A lista existe para o laço de `atualizar` e para o teste que a compara com o
+/// vocabulário do `evdev`: um botão novo tem de aparecer aqui **e** em
+/// [`bit_do_botao`], senão é um botão mudo.
+pub const BOTOES: [Button; 11] = [
+    Button::A,
+    Button::B,
+    Button::X,
+    Button::Y,
+    Button::Back,
+    Button::Start,
+    Button::LeftShoulder,
+    Button::RightShoulder,
+    Button::DPadUp,
+    Button::DPadDown,
+    Button::DPadLeft,
+];
+
+/// Bits do jogo para um botão do SDL — pelo **nome do `buttons.map`**, não pela
+/// posição no plástico.
+///
+/// `Button::A` é `a`, `LeftShoulder` é `l`, `RightShoulder` é `r`. É o que o
+/// `gamecontrollerdb` da imagem garante (`a:b1`, `b:b0`, `leftshoulder:b4`) e o
+/// que faz o caminho do SDL concordar com o do `evdev` sem tabela por console.
+///
+/// O teste `o_mapa_do_sdl_e_o_do_buttons_map` compara esta tabela com
+/// `evdev::bit_do_nome`: era a divergência entre esses dois vocabulários que
+/// fazia o A do R35S frear (issue #1) — e, depois de alinhados, o R1 dar nitro
+/// e o R2 acelerar (issue #2 mediu o contrato e expôs o resto).
+pub fn bit_do_botao(botao: Button) -> Option<u32> {
+    use crate::evdev as b;
+    Some(match botao {
+        Button::A => b::ACELERAR | b::ACEITAR,
+        Button::B => b::FREAR,
+        Button::X => b::PERFIL,
+        Button::Y | Button::Back => b::VOLTAR,
+        // Os dois ombros fazem freio de mão (`l` e `r`), como no aparelho.
+        Button::LeftShoulder | Button::RightShoulder => b::FREIO_MAO,
+        Button::Start => b::INICIAR,
+        Button::DPadUp => b::CIMA,
+        Button::DPadDown => b::BAIXO,
+        Button::DPadLeft => b::ESQUERDA,
+        Button::DPadRight => b::DIREITA,
+        _ => return None,
+    })
 }
 
 /// Aplica zona morta e reescala o resto para `[-1, 1]`.
@@ -241,6 +286,66 @@ mod testes {
     fn o_sinal_e_preservado() {
         assert!(com_zona_morta(-0.8, ZONA_MORTA) < -0.7);
         assert!(com_zona_morta(0.8, ZONA_MORTA) > 0.7);
+    }
+
+    #[test]
+    fn o_mapa_do_sdl_e_o_do_buttons_map() {
+        // A regra da casa: **um mapa por aparelho, uma tradução, nenhum
+        // caminho alternativo**. Os dois caminhos (SDL e evdev) têm de falar o
+        // mesmo vocabulário — o do `buttons.map`. Cada linha aqui é um nome, e
+        // os dois lados são comparados com a **mesma** fonte (`bit_do_nome`).
+        use crate::evdev::bit_do_nome;
+        let pares = [
+            (Button::A, "a"),
+            (Button::B, "b"),
+            (Button::X, "x"),
+            (Button::Y, "y"),
+            (Button::Back, "select"),
+            (Button::Start, "start"),
+            (Button::LeftShoulder, "l"),
+            (Button::RightShoulder, "r"),
+            (Button::DPadUp, "up"),
+            (Button::DPadDown, "down"),
+            (Button::DPadLeft, "left"),
+            (Button::DPadRight, "right"),
+        ];
+        for (botao, nome) in pares {
+            assert_eq!(
+                bit_do_botao(botao),
+                bit_do_nome(nome),
+                "{botao:?} devia ser \"{nome}\""
+            );
+        }
+    }
+
+    #[test]
+    fn o_r2_e_nitro_e_o_r1_e_freio_de_mao() {
+        // A divergência que a issue #2 expôs: no SDL o R1 dava NITRO e o R2
+        // acendia o acelerador pelo eixo. No contrato, `l`/`r` são freio de mão
+        // e `l2`/`r2` são nitro.
+        use crate::evdev::{bit_do_nome, FREIO_MAO, NITRO};
+        assert_eq!(bit_do_botao(Button::RightShoulder), Some(FREIO_MAO));
+        assert_eq!(bit_do_botao(Button::LeftShoulder), Some(FREIO_MAO));
+        assert_eq!(bit_do_nome("r"), Some(FREIO_MAO));
+        assert_eq!(bit_do_nome("r2"), Some(NITRO));
+        // E nada no mapa de botões do SDL acende ACELERAR além do A.
+        assert_eq!(bit_do_botao(Button::RightShoulder), Some(FREIO_MAO));
+        assert_eq!(bit_do_botao(Button::Paddle1), None, "botão sem bit do jogo");
+    }
+
+    #[test]
+    fn a_lista_de_botoes_nao_deixa_botao_mudo() {
+        // `BOTOES` é a que o laço percorre: um botão que tem bit mas não está
+        // na lista é um botão que não funciona, e o sintoma é "não responde".
+        for botao in BOTOES {
+            assert!(
+                bit_do_botao(botao).is_some(),
+                "{botao:?} está em BOTOES mas não tem bit"
+            );
+        }
+        // Os gatilhos são a exceção declarada: só existem como eixo.
+        assert!(!BOTOES.contains(&Button::LeftStick));
+        assert_eq!(bit_do_botao(Button::LeftStick), None);
     }
 
     #[test]

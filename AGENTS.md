@@ -3,13 +3,19 @@
 > Handoff técnico e **regras** deste repositório. Leia antes de continuar.
 > Criado em 15/11/2026.
 >
-> **Três regras, e elas vêm antes de qualquer tarefa:**
+> **Quatro regras, e elas vêm antes de qualquer tarefa:**
 > **R1** repositório alheio é **somente leitura** ([§2](#2-r1--repositório-alheio-é-somente-leitura)) ·
 > **R2** **qualquer alteração** fora daqui vira **issue** ([§3](#3-r2--qualquer-alteração-fora-daqui-vira-issue)) ·
-> **R3** o foco é a `GIOCHI-ENGINE-3D`, outras plataformas em segundo plano ([§4](#4-r3--o-foco-é-a-giochi-engine-3d-outras-plataformas-em-segundo-plano))
+> **R3** o foco é a `GIOCHI-ENGINE-3D`, outras plataformas em segundo plano ([§4](#4-r3--o-foco-é-a-giochi-engine-3d-outras-plataformas-em-segundo-plano)) ·
+> **R4** o alvo é **handheld**; o PC **não** é plataforma de entrega ([§4.1](#41-r4--alvo-handheld-não-pc))
 >
 > Lê-se o que é dos outros. Escreve-se só aqui. Precisa de mudar algo lá fora?
 > Issue, com reprodução — nunca o commit.
+>
+> **Estes jogos não são para PC.** São para handhelds — `aarch64`, KMSDRM, painel
+> pequeno, controle na mão. `x86_64` é a bancada onde se mede e se testa; um
+> binário de PC que funcione não é entrega, e um item não fecha por ele. A regra
+> inteira, com o que é permitido e o que não é, está no [§4.1](#41-r4--alvo-handheld-não-pc).
 >
 > O código deste repositório cita `AGENTS.md §12`, `§23`, `§24`, `§25`, `§31`,
 > `§32` — números do documento do `GIOCHI-APP` **antes** de ele ser compactado e
@@ -21,14 +27,15 @@
 | Jogo | Versão | Engine vendorizada | Testes (`cargo test`) | Binário aarch64 |
 | --- | --- | --- | --- | --- |
 | `cobrinha` | 1.1.0 | 0.5.0 (`f12c09b`) | **72** | 2 913 008 B |
-| `neon-drift` | 1.0.1 | 0.4.0 (`88741aa`) | **360** | 1 315 560 B |
+| `neon-drift` | 1.0.1 | 0.4.0 (`88741aa`) | **385** | 1 315 560 B |
 | `giochi-tower` | 0.1.0 | 0.3.1 (`33a3b92`) | **266** | 2 068 024 B |
 | `giochi-defender` | 0.2.0 | 0.3.1 (`cd94ce6`) | **331** | 2 454 416 B |
 
 Todos os quatro são **Rust + SDL2 + GLES 2.0**, alvo `aarch64-unknown-linux-gnu`
-(consoles Linux com KMSDRM), desenvolvimento em `x86_64`. Cada jogo é um
-workspace Cargo próprio: não há workspace na raiz e não deve haver — os jogos
-partilham a engine, não o `Cargo.lock`.
+(consoles Linux com KMSDRM). O `x86_64` é a **bancada de medição**, não um alvo —
+ver [R4](#41-r4--alvo-handheld-não-pc). Cada jogo é um workspace Cargo próprio:
+não há workspace na raiz e não deve haver — os jogos partilham a engine, não o
+`Cargo.lock`.
 
 ---
 
@@ -246,6 +253,78 @@ Consequências práticas:
   lá (KMSDRM, dono do DRM, `libpng` ausente, vblank de 60 Hz) não aparece
   no PC.
 
+### 4.1 R4 — alvo handheld, não PC
+
+**Os jogos deste repositório são para handhelds. Não são para PC, e não viram.**
+
+A frase não é preferência de gosto: é o que decide o que conta como pronto, o
+que entra num README e onde o esforço é gasto. Um jogo que só abre no PC não
+está entregue; um que abre no aparelho está.
+
+| O que o alvo é | Detalhe |
+| --- | --- |
+| **arquitetura** | `aarch64-unknown-linux-gnu` — o binário versionado em `bin/` é sempre ARM64 |
+| **vídeo** | KMSDRM, `/dev/dri` **exclusivo**, sem X11 e sem Wayland |
+| **entrada** | **controle na mão**, e só ele: sem teclado, sem mouse, sem tela de toque |
+| **painel** | 3,5" a 5", frequentemente girado (retrato 720×1280 no X55) |
+| **GPU** | Mali (Panfrost) com GLES 2.0 como piso |
+| **energia** | bateria; o que esquenta ou drena reprova mesmo que o fps agrade |
+
+| O PC (`x86_64`) **é** | O PC **não é** |
+| --- | --- |
+| bancada de `cargo test`, `cargo clippy` e `cargo build` | plataforma de entrega |
+| gerador de quadro offscreen (`SDL_VIDEODRIVER=offscreen`) | alvo de pacote, instalador ou loja |
+| A/B de desempenho (`--json`, `--benchmark`) | prova de que "está pronto" |
+| ensaio dos caminhos do aparelho (`GIOCHI_INPUT_DIR`, `GIOCHI_MAPA_BOTOES`, `GIOCHI_VEU=0`) | desculpa para código que só existe no PC |
+| lugar de onde se faz `scp`/`ssh` para o aparelho | o que o jogador vê |
+
+Consequências que valem como regra:
+
+- **Não se cria artefato de PC**: nada de instalador, `.desktop`, AppImage,
+  flatpak, pacote de distribuição, alvo Windows/macOS. Um binário `x86_64` no
+  repositório é erro — o `bin/` é `aarch64`, e é `strip`ado. Conferido nos
+  quatro jogos: `file */bin/giochi-*` responde `ARM aarch64` em todos, e o
+  `NEEDED` é só `libSDL2*`, `libc`, `libm` e `libgcc_s`.
+- **Documentação de PC é rotulada como bancada.** `cargo run` no README existe
+  para medir; tem de estar dito que é desenvolvimento. Captura de tela do PC é
+  diagnóstico, não aceitação.
+- **Um caminho de código que só funciona no PC não serve.** O teclado é atalho
+  de desenvolvimento; toda ação precisa de botão equivalente — foi o que a
+  revisão de controles do `neon-drift` teve de corrigir depois do fato (LAN,
+  escala de render e overlay eram inalcançáveis num handheld).
+- **Aceitação é medida no aparelho**, com o binário instalado: `--quadro` no
+  painel real, `--json` de uma corrida real, e o `giochi-launcher` do ciclo de
+  vida. Foi assim que se pegaram o HUD girado, o `libpng` ausente e o teto de
+  59,6 fps por vblank.
+- **Fallback de PC é fallback, não caminho principal.** O `neon-drift` mantém o
+  caminho do SDL porque ele também é o degrau 2 do contrato de entrada num
+  aparelho cujo evdev não abra — não porque o PC seja alvo.
+- **Nada de "depois eu adapto para o aparelho".** Se a decisão depende de
+  `x86_64` (float de 80 bits, `mmap` diferente, tamanho de página, `libc` de
+  desktop), ela não vale como decisão até rodar no alvo.
+
+#### Auditoria: o que ainda depende de teclado ou mouse
+
+Medido em 17/11/2026, procurando ação sem botão equivalente. Uma linha por jogo,
+com o arquivo e a linha da pendência — é o que a próxima sessão precisa para não
+repetir a busca.
+
+| Jogo | Situação | Pendência |
+| --- | --- | --- |
+| `neon-drift` | **completo no controle**: menu do título (mapa, dificuldade, escala, perfil, LAN, jogar), corrida e resultado | — (teclado é bancada, e cada tecla tem botão) |
+| `giochi-tower` | **paridade**: ataque, duas habilidades, item rápido, loja e pausa têm botão (`src/engine_bridge/input.rs`) | — (teclado é alternativa, não caminho único) |
+| `cobrinha` | jogo no controle: direcional, A/START, B/SELECT | **overlay de diagnóstico só no `F1`** — `crates/ui-sdl/src/main.rs:647`, sem botão equivalente |
+| `giochi-defender` | órbita no direcional e no analógico direito; sair pelo `B` no menu | **zoom só na roda do mouse** — `src/main.rs:893`; `camera.zoom` não é chamado por nenhum caminho de controle |
+
+As duas pendências são do mesmo tipo: uma capacidade que existe e não tem como
+ser alcançada com o aparelho na mão. Elas **não** foram corrigidas nesta sessão
+porque mudam controles já documentados dos dois jogos e pedem verificação no
+aparelho; ficam registradas aqui e no README de cada um.
+
+E o corolário que fecha a regra: **um pedido para "deixar no PC" é bancada,
+não escopo.** O dono pode pedir uma cópia local para experimentar; ela vive fora
+do repositório, não é versionada e não muda o alvo.
+
 ---
 
 ## 5. As citações `AGENTS.md §NN` espalhadas no código
@@ -328,7 +407,11 @@ dois casos.
 # testar um jogo (é o comando de verificação; rodar antes de dizer "acabou")
 cd <jogo> && cargo test
 
-# compilar para o aparelho (aarch64, pkg-config cruzado)
+# gerar um quadro sem tela — bancada, não entrega (R4)
+SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy \
+  ./target/release/giochi-<nome> --quadro /tmp/q.bmp --json
+
+# compilar para o aparelho (aarch64, pkg-config cruzado) — ESTE é o que se entrega
 export PKG_CONFIG_ALLOW_CROSS=1
 export PKG_CONFIG_LIBDIR=$HOME/.cache/giochi-arm64/pkgconfig
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$HOME/.cache/giochi-arm64/cc-aarch64.sh
@@ -416,8 +499,11 @@ bundled (§7). Não vale a pena insistir nelas.
   caractere, nem para apagar um temporário. Qualquer alteração que precise de ser
   feita lá fora vira **issue** com reprodução (R2) — o repositório dos outros é
   somente leitura.
-- **Não** entrega para o PC. O alvo é o aparelho com KMSDRM; o PC serve para
-  medir e para os testes sem ecrã (R3).
+- **Não** entrega para o PC, e **não** é um projeto de PC: os quatro jogos são
+  para handhelds (R4). O PC é bancada de medição e de teste sem ecrã — nada de
+  instalador, `.desktop`, AppImage, flatpak ou alvo Windows/macOS.
+- **Não** aceita "funciona no PC" como pronto. Aceitação é `--quadro` no painel
+  real e `--json` de uma corrida no aparelho (R3 e R4).
 
 ---
 

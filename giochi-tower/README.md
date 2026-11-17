@@ -3,6 +3,12 @@
 Tower Defense 3D co-op PvE (2–4 jogadores) sobre a **GIOCHI-ENGINE-3D**, alvo
 `aarch64-unknown-linux-gnu`, mínimo **RK3326 + 1 GB** como cliente.
 
+> **Alvo: handheld — não é um jogo de PC** (regra **R4** do
+> [`AGENTS.md`](../AGENTS.md#41-r4--alvo-handheld-não-pc)). O binário versionado é
+> `aarch64` com KMSDRM e joga-se no controle, na mão; o `x86_64` é **bancada** de
+> medição e de teste sem ecrã — serve para `cargo test` e para o quadro
+> offscreen, nunca para entregar.
+
 > **Estado: M1, M2 e M3 entregues; M4 em 3 de 6.** A engine vem do repositório
 > da engine (`main` = `33a3b92`, com texturas e OBJ), vendorizada em `vendor/` —
 > três crates: `giochi-engine`, `giochi-engine-3d` e `giochi-net`. O jogo abre,
@@ -184,7 +190,7 @@ cargo build --release --target aarch64-unknown-linux-gnu --features sdl2-bundled
 ## Rodar
 
 ```bash
-# PC (usa o SDL2 do sistema)
+# bancada de x86_64 (usa o SDL2 do sistema) — medir, não entregar (R4)
 cargo run --release
 
 # aparelho, com o catálogo do sistema

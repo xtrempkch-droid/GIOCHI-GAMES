@@ -66,6 +66,8 @@ struct Opcoes {
     texturas: Option<String>,
     /// Grava o atlas de sprites em BMP e sai, sem abrir janela.
     atlas: Option<String>,
+    /// Imprime o mapa de botões em vigor e sai, sem abrir janela.
+    mapa_botoes: bool,
     /// Grava a prova de rotação e sai (`--prova-rotacao arquivo.bmp`).
     ///
     /// Três barras em posições conhecidas do **projeto**, com predição numérica do
@@ -113,6 +115,7 @@ impl Default for Opcoes {
         Self {
             quadro: None,
             atlas: None,
+            mapa_botoes: false,
             prova_rotacao: None,
             tamanho: None,
             quadros: None,
@@ -172,6 +175,10 @@ fn opcoes(argv: Vec<String>) -> Result<Opcoes, String> {
                 // processo gira em silêncio, sem imprimir nada e sem abrir
                 // janela. Custou uma rodada de diagnóstico.
                 i += 2;
+            }
+            "--mapa-botoes" => {
+                o.mapa_botoes = true;
+                i += 1;
             }
             "--atlas" => {
                 o.atlas = Some(argv.get(i + 1).ok_or("--atlas sem caminho")?.clone());
@@ -498,6 +505,7 @@ Uso:
   giochi-neon-drift --mapa boavista         escolhe o mapa (avenida, boavista)
   giochi-neon-drift --so asfalto            desenha uma malha só (diagnóstico)
   giochi-neon-drift --texturas t.bmp        grava a folha das 9 texturas e sai
+  giochi-neon-drift --mapa-botoes           imprime o mapa de botões e sai
   giochi-neon-drift --atlas a.bmp           grava o atlas de sprites e sai
   giochi-neon-drift --prova-rotacao r.bmp   grava a prova de orientação e sai
   GIOCHI_SPRITES=x.bmp GIOCHI_SPRITES_COLUNAS=8
@@ -650,6 +658,72 @@ fn gravar_texturas(caminho: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// O fundo sai **magenta**, e não preto: o alfa 0 de uma célula vazia é
 /// indistinguível de um sprite preto sobre preto, e o quadro mentiria sobre ter
 /// desenhado.
+/// Imprime o **mapa de botões em vigor** e a sua origem, sem abrir janela.
+///
+/// Responde no aparelho à pergunta que gerou a issue #1: "esta imagem diz que
+/// o A é qual código, e quem manda nos botões?". Sem isso, a única forma de
+/// descobrir seria apertar o botão e ver qual ação sai — que é exatamente o que
+/// estava errado.
+fn imprimir_mapa_de_botoes() {
+    let do_sistema = evdev::Mapa::do_sistema();
+    match &do_sistema {
+        Some(_) => println!(
+            "fonte: {}",
+            std::env::var("GIOCHI_MAPA_BOTOES")
+                .unwrap_or_else(|_| evdev::CAMINHO_DO_MAPA.to_string())
+        ),
+        None => println!(
+            "fonte: embutido (a = BTN_EAST) — {} não é legível",
+            evdev::CAMINHO_DO_MAPA
+        ),
+    }
+    let mapa = do_sistema.unwrap_or_default();
+    print!("{}", mapa.resumo());
+
+    // Contar dispositivos custa abrir os nós e subir as threads de leitura, e
+    // elas morrem com o processo: é diagnóstico de uma linha só, não um modo de
+    // jogo.
+    let mut botoes = evdev::Botoes::iniciar();
+    let _ = botoes.bits();
+    let forcar = entrada_jogo::Forcar::do_valor(
+        &std::env::var("GIOCHI_CONTROLE").unwrap_or_default(),
+    );
+    let fontes = entrada_jogo::Fontes {
+        evdev_contrato: botoes.contrato(),
+        evdev_fisicos: if botoes.contrato() {
+            0
+        } else {
+            botoes.controles()
+        },
+        mapa_do_sistema: botoes.mapa_do_sistema(),
+        // Este diagnóstico não abre SDL: `sdl: false` diz o que ele sabe.
+        sdl: false,
+        sdl_contrato: false,
+    };
+    // Duas respostas, porque este diagnóstico **não abre SDL**: dizer "nenhum"
+    // só porque o SDL não foi aberto seria um falso negativo — no PC com um
+    // controle de Xbox, o caminho real é o SDL.
+    let com_sdl = entrada_jogo::Fontes {
+        sdl: true,
+        ..fontes
+    };
+    println!(
+        "\n{} dispositivo(s), {} controle(s), contrato: {}",
+        botoes.abertos(),
+        botoes.controles(),
+        if botoes.contrato() {
+            evdev::NOME_DO_CONTRATO
+        } else {
+            "ausente"
+        }
+    );
+    println!(
+        "botoes: {} (evdev) · {} (se o SDL tiver controle)",
+        entrada_jogo::dono(fontes, forcar).nome(),
+        entrada_jogo::dono(com_sdl, forcar).nome()
+    );
+}
+
 fn gravar_atlas(caminho: &str) -> Result<(), Box<dyn std::error::Error>> {
     let lado = atlas::LADO;
     // Respeita `GIOCHI_SPRITES` como o jogo: uma ferramenta que mostra o atlas
@@ -955,6 +1029,10 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         gravar_atlas(caminho)?;
         return Ok(0);
     }
+    if o.mapa_botoes {
+        imprimir_mapa_de_botoes();
+        return Ok(0);
+    }
 
     // GLES 3 por padrão, com queda para 2 — o piso dos aparelhos do projeto.
     if std::env::var_os("GIOCHI_GL_VERSION").is_none() {
@@ -1120,8 +1198,24 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
     }
 
     let mut botoes = evdev::Botoes::iniciar();
+    // `GIOCHI_CONTROLE=sdl|evdev` fura a decisão automática. Sem ele, a
+    // precedência é a do contrato: o nó `Giochi Gamepad` (evdev) manda; sem
+    // ele, o controle do SDL que **é** o contrato; sem ele, o mapa do plástico
+    // desta placa; por último o SDL (o PC). Ver `entrada_jogo::dono`.
+    let forcar = entrada_jogo::Forcar::do_valor(
+        &std::env::var("GIOCHI_CONTROLE").unwrap_or_default(),
+    );
     if !o.json {
-        eprintln!("neon-drift: {} dispositivo(s) de entrada", botoes.abertos());
+        eprintln!(
+            "neon-drift: {} dispositivo(s) de entrada, {} controle(s); mapa do plástico: {}",
+            botoes.abertos(),
+            botoes.controles(),
+            if botoes.mapa_do_sistema() {
+                evdev::CAMINHO_DO_MAPA
+            } else {
+                "embutido (a = BTN_EAST)"
+            }
+        );
     }
     let mut som = if o.sem_som {
         Som::sem_dispositivo()
@@ -1333,7 +1427,15 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
         // para qualquer uso posterior), uma borda de pressão pode cair entre as
         // duas leituras e o quadro age sobre um estado que já mudou.
         gamepad.atualizar();
-        let bits_agora = botoes.bits() | gamepad.bits() | botoes_simulados;
+        // **Um** dono por quadro (issue #1), decidido pelo contrato da issue #2.
+        // Somar as máscaras fazia o A do R35S acelerar e frear no mesmo quadro;
+        // `bits()` também é quem revisa `/dev/input`, então é ele que atualiza a
+        // presença do virtual antes da decisão.
+        let fontes = fontes_de_entrada(&botoes, &gamepad);
+        let dono = entrada_jogo::dono(fontes, forcar);
+        let bits_agora =
+            entrada_jogo::mascara_dos_botoes(botoes.bits(), gamepad.bits(), dono)
+                | botoes_simulados;
         let (mut entrada, acoes) = entrada_jogo::combinar_com_analogico(
             bits_agora,
             gamepad.analogico(),
@@ -1542,7 +1644,7 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
             // duplicada, com o último valor vencendo em silêncio. Duas fontes do
             // mesmo número envelhecem diferente; esta é a que não tem a corrida
             // em mãos.
-            "{{\"quadros\":{quadros},\"passos\":{passos_totais},\"segundos\":{decorrido:.3},\"fps\":{fps_medio:.1},\"fps_teto\":{},\"ms_cpu\":{:.2},\"particulas\":{},\"desenhos\":{},\"efeitos\":{{{}}},\"gles\":{},\"instancing\":{},\"escala\":{:.2},\"lan\":\"{:?}\",\"menu\":\"{}\",\"menu_linha\":{},\"perfil\":{},\"lan_acao\":\"{}\",\"veu\":{:.2},\"batches\":{},\"recursos\":{{\"malhas\":{},\"texturas\":{},\"shaders\":{}}},\"fase\":\"{:?}\",{}}}",
+            "{{\"quadros\":{quadros},\"passos\":{passos_totais},\"segundos\":{decorrido:.3},\"fps\":{fps_medio:.1},\"fps_teto\":{},\"ms_cpu\":{:.2},\"particulas\":{},\"desenhos\":{},\"efeitos\":{{{}}},\"gles\":{},\"instancing\":{},\"escala\":{:.2},\"lan\":\"{:?}\",\"menu\":\"{}\",\"menu_linha\":{},\"perfil\":{},\"lan_acao\":\"{}\",\"veu\":{:.2},\"batches\":{},\"controles_evdev\":{},\"gamepad_sdl\":{},\"mapa_do_sistema\":{},\"contrato_evdev\":{},\"contrato_sdl\":{},\"botoes_de\":\"{}\",\"recursos\":{{\"malhas\":{},\"texturas\":{},\"shaders\":{}}},\"fase\":\"{:?}\",{}}}",
             o.fps,
             if quadros > 0 { ms_cpu / quadros as f64 } else { 0.0 },
             cena.particulas_vivas(),
@@ -1561,6 +1663,15 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
             menu.lan().rotulo(),
             cena.veu(),
             cena.batches(),
+            // Quem manda nos botões, para o próximo diagnóstico não precisar de
+            // um controle na mão: `evdev` é o caminho do aparelho, `sdl` é a
+            // reserva (e `GIOCHI_CONTROLE=sdl` força ela).
+            botoes.controles(),
+            gamepad.ativo(),
+            botoes.mapa_do_sistema(),
+            botoes.contrato(),
+            gamepad.contrato(),
+            entrada_jogo::dono(fontes_de_entrada(&botoes, &gamepad), forcar).nome(),
             // Contagem **depois** do `destruir`: tem de ser (0, 0, 0). Um
             // número diferente de zero é vazamento de GPU, e é este o número
             // que o smoke test confere.
@@ -1583,6 +1694,23 @@ fn principal() -> Result<i32, Box<dyn std::error::Error>> {
     }
     som.encerrar();
     Ok(0)
+}
+
+/// Retrato do que cada caminho de entrada tem aberto.
+///
+/// Existe para a decisão de [`entrada_jogo::dono`] ser uma função pura: o laço
+/// coleta os fatos aqui, e a regra não conhece `Botoes` nem `Gamepad`.
+fn fontes_de_entrada(botoes: &evdev::Botoes, gamepad: &Gamepad) -> entrada_jogo::Fontes {
+    let contrato = botoes.contrato();
+    entrada_jogo::Fontes {
+        evdev_contrato: contrato,
+        // Com o virtual aberto os físicos nem são lidos, então `controles`
+        // conta só ele — e chamá-lo de "físico" mentiria na decisão.
+        evdev_fisicos: if contrato { 0 } else { botoes.controles() },
+        mapa_do_sistema: botoes.mapa_do_sistema(),
+        sdl: gamepad.ativo(),
+        sdl_contrato: gamepad.contrato(),
+    }
 }
 
 /// Liga ou desliga uma tecla do estado.

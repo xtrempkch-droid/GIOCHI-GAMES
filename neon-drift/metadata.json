@@ -9,5 +9,6 @@
   "slug": "neon-drift",
   "license": "Proprietary",
   "category": "Corrida",
-  "releaseYear": 2026
+  "releaseYear": 2026,
+  "kind": "game"
 }

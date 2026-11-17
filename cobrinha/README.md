@@ -4,6 +4,12 @@ Jogo para os consoles Giochi, renderizado pela **GIOCHI-ENGINE 3D** com SDL2 e
 OpenGL ES. O tabuleiro, as paredes, a cobra e a fruta são geometria 3D. O HUD,
 as partículas, as texturas e o hot reload vêm da engine 0.5.
 
+> **Alvo: handheld — não é um jogo de PC** (regra **R4** do
+> [`AGENTS.md`](../AGENTS.md#41-r4--alvo-handheld-não-pc)). O binário versionado é
+> `aarch64` com KMSDRM e joga-se no controle, na mão; o `x86_64` é **bancada** de
+> medição e de teste sem ecrã — serve para `cargo test` e para o quadro
+> offscreen, nunca para entregar.
+
 A cópia da engine usada pelo jogo fica em [`vendor/`](./vendor/), isolada do
 repositório compartilhado `GIOCHI-ENGINE-3D`. O snapshot agora corresponde à
 **0.5.0**, commit `f12c09b`, e inclui as fases 19–24 (hot reload, devtools, UI,
@@ -234,8 +240,18 @@ sem isso o HUD piscaria ausente no arranque.
 | direcional (544–547) | muda a direção |
 | A (304) / START (315) | começa ou recomeça |
 | B (305) / SELECT (314) | sai |
-| setas, Espaço, Esc, Q (PC) | controles equivalentes |
-| F1 (PC) | abre/fecha o diagnóstico do HUD |
+| setas, Espaço, Esc, Q | atalho **de bancada** (x86_64), não suporte a PC |
+| F1 | abre/fecha o diagnóstico do HUD — também de bancada |
+
+O jogo é jogado no controle: as linhas de teclado existem para desenvolver sem
+o aparelho na mão, e uma ação que só exista em tecla é defeito (R4).
+
+> **Pendência R4 (registrada, não corrigida):** o overlay de diagnóstico
+> (`F1`, `crates/ui-sdl/src/main.rs:647`) **não tem botão equivalente**, então
+> num handheld ele é inalcançável. É a mesma classe de defeito que a revisão de
+> controles do `neon-drift` corrigiu lá. A correção óbvia é dar o overlay a um
+> botão livre e manter o `F1` como atalho — mas isso muda o mapa documentado e
+> pede verificação no aparelho, por isso está aqui antes de ser feita.
 
 Até três mudanças de direção podem ficar enfileiradas para que viradas rápidas
 sejam aplicadas em passos sucessivos, sem aceitar uma inversão de 180°.

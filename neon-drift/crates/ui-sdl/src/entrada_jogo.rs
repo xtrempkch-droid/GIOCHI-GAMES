@@ -95,11 +95,13 @@ pub fn bordas(anterior: Acoes, atual: Acoes) -> Acoes {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Analogico {
     /// Volante, `-1` (esquerda) a `1` (direita).
+    ///
+    /// **Só o volante.** Os gatilhos já não entram aqui: no contrato `l2`/`r2`
+    /// são `NITRO` e `l`/`r` são freio de mão, e ler o eixo do gatilho como
+    /// acelerador transformava o R2 em acelerar **e** nitro no mesmo quadro —
+    /// o defeito da issue #1 por outra porta. Acelerar e frear são botões
+    /// (`a`/`b`), no aparelho e no contrato.
     pub virar: f32,
-    /// Gatilho direito, `0..1`.
-    pub acelerar: f32,
-    /// Gatilho esquerdo, `0..1`.
-    pub frear: f32,
 }
 
 /// Combina as duas fontes de entrada com a fase atual.
@@ -107,12 +109,147 @@ pub fn combinar(bits: u32, teclas: &Teclas, fase: Fase) -> (Entrada, Acoes) {
     combinar_com_analogico(bits, Analogico::default(), teclas, fase)
 }
 
+// ── um contrato, uma fonte por quadro ──────────────────────────────
+//
+// O GIOCHI-SYSTEM publica **um controle virtual** chamado `Giochi Gamepad`
+// (issue #2): um nó só, com botões e eixos, 17 botões de códigos fixos e quatro
+// eixos em -32767..32767. O `gamecontrollerdb.txt` da imagem mapeia `a:b1`, de
+// modo que o `Button::A` do SDL é o `a` do `buttons.map` em **todas** as placas.
+//
+// Isso resolve a classe do defeito da issue #1 sem `if` por console: quando o
+// contrato está presente, os dois caminhos (SDL e evdev) concordam por
+// construção. Quando ele **não** está (imagem antiga, PC), aí sim há dois mapas
+// diferentes e é preciso escolher — e escolher é o que esta seção faz.
+//
+// A regra da casa: **um mapa por aparelho, uma tradução, nenhum caminho
+// alternativo.** Nunca somar duas fontes: somar foi o que fez o A do R35S
+// acelerar e frear no mesmo quadro.
+
+/// O que `GIOCHI_CONTROLE` pediu.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Forcar {
+    /// Segue a precedência do contrato.
+    #[default]
+    Automatico,
+    /// Usa o SDL sempre que ele tiver controle (`GIOCHI_CONTROLE=sdl`).
+    Sdl,
+    /// Usa o evdev sempre que ele tiver controle (`GIOCHI_CONTROLE=evdev`).
+    Evdev,
+}
+
+impl Forcar {
+    /// `sdl`, `evdev` ou qualquer outra coisa = automático.
+    pub fn do_valor(valor: &str) -> Self {
+        match valor.trim().to_ascii_lowercase().as_str() {
+            "sdl" => Self::Sdl,
+            "evdev" => Self::Evdev,
+            _ => Self::Automatico,
+        }
+    }
+}
+
+/// O que cada caminho tem aberto **neste** quadro.
+///
+/// Números e nomes, não os objetos: assim a decisão é uma função pura e o teste
+/// dela não precisa de placa, de `/dev` nem de SDL.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Fontes {
+    /// O nó `Giochi Gamepad` está aberto no evdev (o contrato, pelo lado cru).
+    pub evdev_contrato: bool,
+    /// Quantos controles **físicos** o evdev abriu.
+    pub evdev_fisicos: usize,
+    /// `/etc/giochi/buttons.map` foi lido (o mapa do plástico desta placa).
+    pub mapa_do_sistema: bool,
+    /// O SDL tem um controle aberto.
+    pub sdl: bool,
+    /// O controle aberto pelo SDL **é** o `Giochi Gamepad`.
+    pub sdl_contrato: bool,
+}
+
+/// Quem fornece botões e eixos neste quadro. **Um** só.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dono {
+    /// O `evdev`, com os códigos que o mapa da placa declara.
+    Evdev,
+    /// O SDL, que normaliza botões e eixos pelo `gamecontrollerdb`.
+    Sdl,
+    /// Nem um nem outro: só teclado.
+    Nenhum,
+}
+
+impl Dono {
+    pub fn nome(self) -> &'static str {
+        match self {
+            Dono::Evdev => "evdev",
+            Dono::Sdl => "sdl",
+            Dono::Nenhum => "nenhum",
+        }
+    }
+}
+
+/// Decide a fonte do quadro.
+///
+/// A precedência, e o porquê de cada degrau:
+///
+/// 1. **Contrato pelo evdev** — o nó virtual está aberto: os códigos são fixos
+///    e não dependem do `gamecontrollerdb`. É o caminho mais determinístico.
+/// 2. **Contrato pelo SDL** — o controle aberto é o `Giochi Gamepad`: o
+///    `gamecontrollerdb` da imagem garante `Button::A = a`.
+/// 3. **Físico com mapa do plástico** — imagem sem o virtual: o `buttons.map`
+///    é a única descrição de qual código é o `a` nesta placa (é o caso da X35S,
+///    que troca A e B de verdade).
+/// 4. **SDL** — o PC, onde não há `buttons.map` e o `Button::A` do SDL é
+///    `BTN_SOUTH` de verdade; e qualquer placa cujo evdev não abra nada.
+///
+/// `forcar` fura os degraus 1–4, mas nunca devolve uma fonte que não exista:
+/// ficar sem controle é pior que usar o mapa "errado" do outro caminho.
+pub fn dono(fontes: Fontes, forcar: Forcar) -> Dono {
+    let evdev = fontes.evdev_contrato || fontes.evdev_fisicos > 0;
+    match forcar {
+        Forcar::Evdev if evdev => Dono::Evdev,
+        Forcar::Sdl if fontes.sdl => Dono::Sdl,
+        Forcar::Evdev | Forcar::Sdl => {
+            // O caminho pedido não existe: cai para o que houver, em vez de
+            // deixar o jogo sem controle nenhum.
+            if evdev {
+                Dono::Evdev
+            } else if fontes.sdl {
+                Dono::Sdl
+            } else {
+                Dono::Nenhum
+            }
+        }
+        Forcar::Automatico => {
+            if fontes.evdev_contrato {
+                Dono::Evdev
+            } else if fontes.sdl_contrato {
+                Dono::Sdl
+            } else if fontes.mapa_do_sistema && fontes.evdev_fisicos > 0 {
+                Dono::Evdev
+            } else if fontes.sdl {
+                Dono::Sdl
+            } else {
+                Dono::Nenhum
+            }
+        }
+    }
+}
+
+/// A máscara de botões do quadro: a do **dono**, nunca as duas somadas.
+pub fn mascara_dos_botoes(evdev: u32, sdl: u32, dono: Dono) -> u32 {
+    match dono {
+        Dono::Evdev => evdev,
+        Dono::Sdl => sdl,
+        Dono::Nenhum => 0,
+    }
+}
+
 /// Combina teclado, botões e eixos analógicos.
 ///
-/// Os eixos **somam** ao que os botões pedem, mas cada canal é limitado a 1:
-/// apertar acelerar no gatilho e na seta ao mesmo tempo não dá o dobro de
-/// aceleração. A assinatura separada de [`combinar`] mantém a função pura e
-/// testável — o `evdev` e o gamepad entram por máscara, o analógico por valor.
+/// O volante **soma** ao que o direcional pede, limitado a 1: apertar a seta e
+/// torcer o analógico no mesmo sentido não vira duas vezes. A assinatura
+/// separada de [`combinar`] mantém a função pura e testável — os botões entram
+/// por máscara, o volante por valor.
 pub fn combinar_com_analogico(
     bits: u32,
     analogico: Analogico,
@@ -144,9 +281,7 @@ pub fn combinar_com_analogico(
         virar += 1.0;
     }
 
-    // Gatilhos e analógico entram depois dos bits, com `max`/soma limitada.
-    acelerar = acelerar.max(analogico.acelerar.clamp(0.0, 1.0));
-    frear = frear.max(analogico.frear.clamp(0.0, 1.0));
+    // O volante entra depois dos bits, com soma limitada.
     virar += analogico.virar.clamp(-1.0, 1.0);
 
     if teclas.cima {
@@ -462,36 +597,8 @@ mod testes {
     }
 
     #[test]
-    fn o_gatilho_acelera_proporcionalmente() {
-        let analógico = Analogico {
-            acelerar: 0.42,
-            ..Analogico::default()
-        };
-        let (e, _) = combinar_com_analogico(0, analógico, &sem_teclas(), Fase::Correndo);
-        assert!((e.acelerar - 0.42).abs() < 1e-6);
-        assert_eq!(e.frear, 0.0);
-    }
-
-    #[test]
-    fn teclado_e_gatilho_nao_somam_alem_de_um() {
-        let analógico = Analogico {
-            acelerar: 0.8,
-            ..Analogico::default()
-        };
-        let teclas = Teclas {
-            cima: true,
-            ..sem_teclas()
-        };
-        let (e, _) = combinar_com_analogico(0, analógico, &teclas, Fase::Correndo);
-        assert_eq!(e.acelerar, 1.0);
-    }
-
-    #[test]
-    fn o_analogico_vira_e_a_soma_fica_no_limite() {
-        let analógico = Analogico {
-            virar: 0.75,
-            ..Analogico::default()
-        };
+    fn o_volante_vira_e_a_soma_fica_no_limite() {
+        let analógico = Analogico { virar: 0.75 };
         let (e, _) = combinar_com_analogico(0, analógico, &sem_teclas(), Fase::Correndo);
         assert!((e.virar - 0.75).abs() < 1e-6);
 
@@ -504,17 +611,159 @@ mod testes {
     }
 
     #[test]
+    fn o_volante_nao_acelera_nem_freia() {
+        // O contrato não declara acelerador analógico: `a` e `b` são botões, e
+        // `l2`/`r2` são nitro. Se o volante mexesse no acelerador, o carro
+        // andaria sozinho ao fazer uma curva.
+        let (e, _) = combinar_com_analogico(
+            0,
+            Analogico { virar: -0.9 },
+            &sem_teclas(),
+            Fase::Correndo,
+        );
+        assert_eq!((e.acelerar, e.frear), (0.0, 0.0));
+    }
+
+    #[test]
     fn o_analogico_nao_escolhe_mapa_no_titulo() {
         // O stick analógico é volante, não menu: no título ele não pode trocar
         // de pista a cada quadro por causa de ruído de repouso. Quem navega é o
         // **direcional**, que é discreto e tem borda.
-        let analógico = Analogico {
-            virar: 0.9,
-            acelerar: 0.9,
-            frear: 0.9,
-        };
-        let (_, a) = combinar_com_analogico(0, analógico, &sem_teclas(), Fase::Titulo);
+        let (_, a) = combinar_com_analogico(
+            0,
+            Analogico { virar: 0.9 },
+            &sem_teclas(),
+            Fase::Titulo,
+        );
         assert_eq!(a.ajustar, 0);
         assert_eq!(a.navegar, 0);
+    }
+
+    // ── o contrato manda: um dono por quadro (issues #1 e #2) ───────
+
+    fn sem_fontes() -> Fontes {
+        Fontes::default()
+    }
+
+    /// Contrato pelo evdev, e nada mais.
+    fn com_contrato_evdev() -> Fontes {
+        Fontes {
+            evdev_contrato: true,
+            evdev_fisicos: 1,
+            mapa_do_sistema: true,
+            sdl: true,
+            sdl_contrato: true,
+        }
+    }
+
+    #[test]
+    fn o_contrato_pelo_evdev_vence_tudo() {
+        // É o degrau mais determinístico: códigos fixos, sem depender do
+        // `gamecontrollerdb` nem de tabela por placa.
+        assert_eq!(dono(com_contrato_evdev(), Forcar::Automatico), Dono::Evdev);
+    }
+
+    #[test]
+    fn o_contrato_pelo_sdl_basta_quando_nao_ha_no_evdev() {
+        // O PC, e a placa em que o evdev não abriu nada: o `gamecontrollerdb`
+        // da imagem garante `Button::A = a`, então o SDL é tão bom quanto.
+        let fontes = Fontes {
+            sdl: true,
+            sdl_contrato: true,
+            ..sem_fontes()
+        };
+        assert_eq!(dono(fontes, Forcar::Automatico), Dono::Sdl);
+    }
+
+    #[test]
+    fn sem_contrato_o_mapa_do_plastico_ainda_decide() {
+        // Imagem antiga, sem o `Giochi Gamepad`: o SDL abre o nó físico com o
+        // mapeamento automático errado (`a:b0` no R35S). Quem sabe qual código é
+        // o `a` é o `buttons.map`, então o evdev manda.
+        let fontes = Fontes {
+            evdev_fisicos: 1,
+            mapa_do_sistema: true,
+            sdl: true,
+            sdl_contrato: false,
+            ..sem_fontes()
+        };
+        assert_eq!(dono(fontes, Forcar::Automatico), Dono::Evdev);
+    }
+
+    #[test]
+    fn sem_contrato_e_sem_mapa_o_sdl_manda() {
+        // O PC: não há `/etc/giochi/buttons.map`, e o `Button::A` do SDL é
+        // `BTN_SOUTH` de verdade num controle de Xbox.
+        let fontes = Fontes {
+            evdev_fisicos: 1,
+            sdl: true,
+            ..sem_fontes()
+        };
+        assert_eq!(dono(fontes, Forcar::Automatico), Dono::Sdl);
+    }
+
+    #[test]
+    fn um_teclado_aberto_nao_e_controle() {
+        // `controles` só conta nó que declara código do jogo; um teclado aberto
+        // não pode escolher a fonte.
+        assert_eq!(dono(sem_fontes(), Forcar::Automatico), Dono::Nenhum);
+        assert_eq!(
+            dono(
+                Fontes {
+                    mapa_do_sistema: true,
+                    ..sem_fontes()
+                },
+                Forcar::Automatico
+            ),
+            Dono::Nenhum
+        );
+    }
+
+    #[test]
+    fn a_mascara_e_a_do_dono_e_nunca_a_soma() {
+        // A regra que fecha a issue #1: com o A apertado, o evdev acende
+        // ACELERAR e o SDL acende FREAR. Somados, o carro freia; do dono, não.
+        let do_evdev = evdev::ACELERAR | evdev::ACEITAR;
+        let do_sdl = evdev::FREAR;
+        let mascara = mascara_dos_botoes(do_evdev, do_sdl, Dono::Evdev);
+        assert_eq!(mascara, do_evdev, "só o evdev");
+        assert_eq!(mascara_dos_botoes(do_evdev, do_sdl, Dono::Sdl), do_sdl);
+        assert_eq!(mascara_dos_botoes(do_evdev, do_sdl, Dono::Nenhum), 0);
+
+        let (e, _) =
+            combinar_com_analogico(mascara, Analogico::default(), &sem_teclas(), Fase::Correndo);
+        assert_eq!(e.acelerar, 1.0);
+        assert_eq!(e.frear, 0.0);
+    }
+
+    #[test]
+    fn forcar_nao_deixa_o_jogo_sem_controle() {
+        // O caminho pedido que não existe cai para o que existe: ficar sem
+        // controle é pior que usar o mapa do outro caminho.
+        let so_sdl = Fontes {
+            sdl: true,
+            ..sem_fontes()
+        };
+        assert_eq!(dono(so_sdl, Forcar::Evdev), Dono::Sdl);
+        let so_evdev = Fontes {
+            evdev_fisicos: 1,
+            ..sem_fontes()
+        };
+        assert_eq!(dono(so_evdev, Forcar::Sdl), Dono::Evdev);
+        assert_eq!(dono(sem_fontes(), Forcar::Sdl), Dono::Nenhum);
+
+        // E quando o caminho existe, ele é respeitado.
+        assert_eq!(dono(com_contrato_evdev(), Forcar::Sdl), Dono::Sdl);
+        assert_eq!(dono(so_evdev, Forcar::Evdev), Dono::Evdev);
+        assert_eq!(Forcar::do_valor("SDL"), Forcar::Sdl);
+        assert_eq!(Forcar::do_valor("evdev"), Forcar::Evdev);
+        assert_eq!(Forcar::do_valor(" lixo "), Forcar::Automatico);
+    }
+
+    #[test]
+    fn o_nome_do_dono_e_o_que_vai_para_o_json() {
+        assert_eq!(Dono::Evdev.nome(), "evdev");
+        assert_eq!(Dono::Sdl.nome(), "sdl");
+        assert_eq!(Dono::Nenhum.nome(), "nenhum");
     }
 }
